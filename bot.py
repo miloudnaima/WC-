@@ -2,10 +2,6 @@
 Telegram Football Prediction Bot
 Stack: Telegram Bot API + The Odds API + Google Gemini API
 Hosting: Render (Web Service) + GitHub (source control / auto-deploy)
-
-Flow:
-  Telegram -> Render webhook (Flask) -> The Odds API (odds data)
-           -> Gemini API (analysis) -> back to Telegram
 """
 
 import os
@@ -18,7 +14,6 @@ log = logging.getLogger("predict-bot")
 
 app = Flask(__name__)
 
-# ---------- CONFIG (set these as Environment Variables on Render, never hardcode) ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ODDS_API_KEY = os.environ["ODDS_API_KEY"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
@@ -31,7 +26,6 @@ GEMINI_URL = (
     "gemini-2.0-flash:generateContent?key=" + GEMINI_API_KEY
 )
 
-# ---------- HELPERS ----------
 
 def send_message(chat_id, text):
     try:
@@ -45,7 +39,6 @@ def send_message(chat_id, text):
 
 
 def get_odds(regions="eu", markets="h2h,totals", limit=15):
-    """Pull upcoming soccer odds from The Odds API (free tier: 500 req/month)."""
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": regions,
@@ -64,7 +57,6 @@ def get_odds(regions="eu", markets="h2h,totals", limit=15):
 
 
 def ask_gemini(prompt):
-    """Send a prompt to Gemini free tier and return plain text response."""
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         r = requests.post(GEMINI_URL, json=payload, timeout=30)
@@ -86,18 +78,20 @@ def build_matches_text(matches):
         bookmakers = m.get("bookmakers", [])
         if bookmakers:
             outcomes = bookmakers[0]["markets"][0]["outcomes"]
-            odds_str = ", ".join(f"{o[\'name\']}: {o[\'price\']}" for o in outcomes)
+            odds_str = ", ".join(f"{o['name']}: {o['price']}" for o in outcomes)
             line += f" | Odds: {odds_str}"
         lines.append(line)
-    return "\n".join(lines) if lines else "No upcoming matches found."
+    return "
+".join(lines) if lines else "No upcoming matches found."
 
 
 DISCLAIMER = (
-    "\n\n⚠️ This is data-based analysis, not a guarantee. Bet responsibly, "
+    "
+
+⚠️ This is data-based analysis, not a guarantee. Bet responsibly, "
     "never stake more than you can afford to lose."
 )
 
-# ---------- COMMAND LOGIC ----------
 
 def cmd_predict_today():
     matches = get_odds(limit=20)
@@ -107,7 +101,10 @@ def cmd_predict_today():
         "odds data below, identify the 5 matches today with the clearest "
         "statistical edge. For each, give: match, suggested bet type "
         "(1X2/over-under), confidence (Low/Medium/High), and a 1-line reason. "
-        "Be realistic, never claim certainty.\n\nMatch data:\n" + matches_text
+        "Be realistic, never claim certainty.
+
+Match data:
+" + matches_text
     )
     return ask_gemini(prompt) + DISCLAIMER
 
@@ -119,7 +116,9 @@ def cmd_predict_now():
         "From the match list below, select only matches starting within the "
         "next 2 hours (check commence_time against current UTC time). Give a "
         "quick betting read for each: suggested market, confidence level, "
-        "and reasoning based on the odds shown. If none start soon, say so.\n\n"
+        "and reasoning based on the odds shown. If none start soon, say so.
+
+"
         + matches_text
     )
     return ask_gemini(prompt) + DISCLAIMER
@@ -132,7 +131,9 @@ def cmd_value_bets():
         "Act as a sharp bettor looking for value. Using the odds below, "
         "estimate implied probability for each outcome, then flag any match "
         "where you believe the market odds look mispriced or offer value "
-        "compared to typical team strength assumptions. Explain briefly.\n\n"
+        "compared to typical team strength assumptions. Explain briefly.
+
+"
         + matches_text
     )
     return ask_gemini(prompt) + DISCLAIMER
@@ -158,24 +159,31 @@ def cmd_form_h2h(query_text, mode="form"):
 
 
 HELP_TEXT = (
-    "*Available commands:*\n"
-    "/predict_today - Best data-backed picks for today\n"
-    "/predict_now - Matches starting in the next 2 hours\n"
-    "/value_bets - Matches where odds may be mispriced\n"
-    "/corners <team1> vs <team2> - Corner market estimate\n"
-    "/cards <team1> vs <team2> - Card market estimate\n"
-    "/form <team> - Recent form summary\n"
-    "/h2h <team1> vs <team2> - Head-to-head history\n"
+    "*Available commands:*
+"
+    "/predict_today - Best data-backed picks for today
+"
+    "/predict_now - Matches starting in the next 2 hours
+"
+    "/value_bets - Matches where odds may be mispriced
+"
+    "/corners <team1> vs <team2> - Corner market estimate
+"
+    "/cards <team1> vs <team2> - Card market estimate
+"
+    "/form <team> - Recent form summary
+"
+    "/h2h <team1> vs <team2> - Head-to-head history
+"
     "/help - Show this menu"
 )
 
-# ---------- WEBHOOK ----------
 
-@app.route(f"/webhook/{{}}".format(WEBHOOK_SECRET), methods=["POST"])
+@app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
 def webhook():
-    update = request.get_json(force=True, silent=True) or {{}}
-    message = update.get("message", {{}})
-    chat_id = message.get("chat", {{}}).get("id")
+    update = request.get_json(force=True, silent=True) or {}
+    message = update.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
     text = (message.get("text") or "").strip()
 
     if not chat_id or not text:
