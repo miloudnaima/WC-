@@ -70,16 +70,52 @@ def build_matches_text(matches):
 def ask_gemini(prompt):
     if not GEMINI_API_KEY:
         return "Gemini API key missing in Render environment variables."
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+    }
+
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
     try:
-        r = requests.post(GEMINI_URL, json=payload, timeout=30)
-        r.raise_for_status()
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        if r.status_code != 200:
+            log.error("Gemini status=%s body=%s", r.status_code, r.text)
+            return "Gemini error " + str(r.status_code) + ": " + r.text[:500]
+
         data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return "Gemini returned no candidates: " + json.dumps(data)[:500]
+
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            return "Gemini returned no text parts: " + json.dumps(data)[:500]
+
+        text = parts[0].get("text", "")
+        if not text:
+            return "Gemini returned empty text: " + json.dumps(data)[:500]
+
+        return text
+
     except Exception as e:
         log.exception("Gemini API failed: %s", e)
-        return "Analysis engine unavailable right now."
-
+        return "Gemini request exception: " + str(e)
 
 def predict_today_text():
     matches = get_odds(6)
