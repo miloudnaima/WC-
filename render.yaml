@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: telegram-predict-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn bot:app
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: ODDS_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
