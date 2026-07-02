@@ -6,7 +6,6 @@ from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("predict-bot")
-
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -21,22 +20,15 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0
 
 def send_message(chat_id, text):
     try:
-        r = requests.post(
-            TELEGRAM_API + "/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=20,
-        )
-        log.info("sendMessage status=%s body=%s", r.status_code, r.text)
-        return r
+        r = requests.post(TELEGRAM_API + "/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=20)
+        log.info("sendMessage status=%s", r.status_code)
     except Exception as e:
         log.exception("Telegram send failed: %s", e)
-        return None
 
 
-def get_odds(limit=8):
+def get_odds(limit=6):
     if not ODDS_API_KEY:
         return []
-
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
@@ -44,7 +36,6 @@ def get_odds(limit=8):
         "oddsFormat": "decimal",
         "dateFormat": "iso",
     }
-
     try:
         r = requests.get(ODDS_API_URL, params=params, timeout=20)
         r.raise_for_status()
@@ -57,46 +48,29 @@ def get_odds(limit=8):
 
 def build_matches_text(matches):
     lines = []
-
     for m in matches:
-        home = m.get("home_team", "?")
-        away = m.get("away_team", "?")
-        commence = m.get("commence_time", "?")
-        line = f"{home} vs {away} ({commence})"
-
+        home = str(m.get("home_team", "?"))
+        away = str(m.get("away_team", "?"))
+        commence = str(m.get("commence_time", "?"))
+        line = home + " vs " + away + " (" + commence + ")"
         bookmakers = m.get("bookmakers", [])
         if bookmakers:
             try:
                 outcomes = bookmakers[0]["markets"][0]["outcomes"]
                 parts = []
                 for o in outcomes:
-                    parts.append(f"{o.get('name')}: {o.get('price')}")
-                line += " | Odds: " + ", ".join(parts)
+                    parts.append(str(o.get("name")) + ": " + str(o.get("price")))
+                line = line + " | Odds: " + ", ".join(parts)
             except Exception:
                 pass
-
         lines.append(line)
-
-    return "
-".join(lines) if lines else "No upcoming matches found."
+    return chr(10).join(lines) if lines else "No upcoming matches found."
 
 
 def ask_gemini(prompt):
     if not GEMINI_API_KEY:
         return "Gemini API key missing in Render environment variables."
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    }
-
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         r = requests.post(GEMINI_URL, json=payload, timeout=30)
         r.raise_for_status()
@@ -107,116 +81,47 @@ def ask_gemini(prompt):
         return "Analysis engine unavailable right now."
 
 
-HELP_TEXT = """Available commands:
-/start - start the bot
-/help - show commands
-/ping - simple test
-/predict_today - today's best data-backed picks
-/predict_now - matches starting soon
-/value_bets - possible value bets
-/corners team1 vs team2 - corners estimate
-/cards team1 vs team2 - cards estimate
-/form team - recent form summary
-/h2h team1 vs team2 - head-to-head summary"""
-
-
-DISCLAIMER = "
-
-Warning: this is data-assisted analysis, not a guaranteed winning signal."
-
-
-def cmd_predict_today():
-    matches = get_odds(limit=8)
+def predict_today_text():
+    matches = get_odds(6)
     matches_text = build_matches_text(matches)
-
     if matches_text == "No upcoming matches found.":
         return matches_text
-
-    prompt = (
-        "You are a football betting analyst. "
-        "Use ONLY the odds data below. "
-        "Choose the 3 strongest betting angles for today. "
-        "For each one give: match, suggested market, confidence "
-        "(Low/Medium/High), and one short reason. "
-        "Do not promise certainty.
-
-"
-        f"Match data:
-{matches_text}"
-    )
-
-    return ask_gemini(prompt) + DISCLAIMER
+    prompt = "You are a football betting analyst. Use only the odds data below. Pick the 3 best betting angles for today. For each give match, market, confidence and one short reason. Do not promise certainty." + chr(10) + chr(10) + matches_text
+    result = ask_gemini(prompt)
+    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
-def cmd_predict_now():
-    matches = get_odds(limit=10)
+def predict_now_text():
+    matches = get_odds(8)
     matches_text = build_matches_text(matches)
-
     if matches_text == "No upcoming matches found.":
         return matches_text
-
-    prompt = (
-        "You are a football betting analyst. "
-        "From the match list below, identify matches starting soon "
-        "and give a short betting read for each one. "
-        "If exact start timing is unclear, still provide the best short analysis. "
-        "Keep it practical and not overconfident.
-
-"
-        f"Match data:
-{matches_text}"
-    )
-
-    return ask_gemini(prompt) + DISCLAIMER
+    prompt = "You are a football betting analyst. From the odds data below, give short picks for matches starting soon. Keep it practical and careful." + chr(10) + chr(10) + matches_text
+    result = ask_gemini(prompt)
+    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
-def cmd_value_bets():
-    matches = get_odds(limit=10)
+def value_bets_text():
+    matches = get_odds(8)
     matches_text = build_matches_text(matches)
-
     if matches_text == "No upcoming matches found.":
         return matches_text
-
-    prompt = (
-        "You are a sharp football bettor. "
-        "Using the odds below, flag any possible value bets and explain "
-        "briefly why the price may be interesting. "
-        "Keep it realistic and avoid certainty.
-
-"
-        f"Match data:
-{matches_text}"
-    )
-
-    return ask_gemini(prompt) + DISCLAIMER
+    prompt = "You are a sharp football bettor. Using the odds below, flag possible value bets and explain briefly why the odds may be interesting. Avoid certainty." + chr(10) + chr(10) + matches_text
+    result = ask_gemini(prompt)
+    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
-def cmd_corners_cards(query_text, mode):
-    prompt = (
-        f"You are a football stats analyst. "
-        f"Give a careful estimate for {mode} on this match: {query_text}. "
-        f"Keep it short, practical, and not overconfident."
-    )
-    return ask_gemini(prompt) + DISCLAIMER
+def simple_ai_text(user_text, mode_name):
+    prompt = "You are a football analyst. Give a short and practical answer for " + mode_name + " about: " + user_text
+    result = ask_gemini(prompt)
+    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
-def cmd_form_h2h(query_text, mode):
-    if mode == "form":
-        prompt = (
-            f"Summarize the likely recent form for this football team or match-up: "
-            f"{query_text}. Keep it concise."
-        )
-    else:
-        prompt = (
-            f"Summarize the head-to-head tendency for this football match-up: "
-            f"{query_text}. Keep it concise."
-        )
-
-    return ask_gemini(prompt) + DISCLAIMER
+HELP_TEXT = "Commands: /start /help /ping /predict_today /predict_now /value_bets /corners team1 vs team2 /cards team1 vs team2 /form team /h2h team1 vs team2"
 
 
 @app.route("/", methods=["GET"])
-def health():
+def home():
     return "Bot is alive.", 200
 
 
@@ -225,16 +130,12 @@ def webhook():
     try:
         update = request.get_json(force=True, silent=True) or {}
         log.info("Incoming update: %s", json.dumps(update))
-
         message = update.get("message", {})
         chat_id = message.get("chat", {}).get("id")
         text = (message.get("text") or "").strip()
-
         if not chat_id:
             return jsonify(ok=True)
-
         lower = text.lower()
-
         if lower.startswith("/start"):
             reply = "Bot connected. Send /help"
         elif lower.startswith("/help"):
@@ -242,29 +143,27 @@ def webhook():
         elif lower.startswith("/ping"):
             reply = "pong"
         elif lower.startswith("/predict_today"):
-            reply = cmd_predict_today()
+            reply = predict_today_text()
         elif lower.startswith("/predict_now"):
-            reply = cmd_predict_now()
+            reply = predict_now_text()
         elif lower.startswith("/value_bets"):
-            reply = cmd_value_bets()
+            reply = value_bets_text()
         elif lower.startswith("/corners"):
             query_text = text.replace("/corners", "").strip() or "general matches today"
-            reply = cmd_corners_cards(query_text, "corners")
+            reply = simple_ai_text(query_text, "corners")
         elif lower.startswith("/cards"):
             query_text = text.replace("/cards", "").strip() or "general matches today"
-            reply = cmd_corners_cards(query_text, "cards")
+            reply = simple_ai_text(query_text, "cards")
         elif lower.startswith("/form"):
             query_text = text.replace("/form", "").strip() or "general team"
-            reply = cmd_form_h2h(query_text, "form")
+            reply = simple_ai_text(query_text, "recent form")
         elif lower.startswith("/h2h"):
             query_text = text.replace("/h2h", "").strip() or "general matchup"
-            reply = cmd_form_h2h(query_text, "h2h")
+            reply = simple_ai_text(query_text, "head to head")
         else:
-            reply = "Unknown command. Send /help."
-
+            reply = "Unknown command. Send /help"
         send_message(chat_id, reply)
         return jsonify(ok=True)
-
     except Exception as e:
         log.exception("Webhook error: %s", e)
         return jsonify(ok=False, error=str(e)), 500
