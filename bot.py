@@ -10,18 +10,20 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
 
 TELEGRAM_API = "https://api.telegram.org/bot" + TELEGRAM_TOKEN
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/soccer/odds"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + GEMINI_API_KEY
 
 
 def send_message(chat_id, text):
     try:
-        r = requests.post(TELEGRAM_API + "/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=20)
-        log.info("sendMessage status=%s", r.status_code)
+        requests.post(
+            TELEGRAM_API + "/sendMessage",
+            json={"chat_id": chat_id, "text": text},
+            timeout=20
+        )
     except Exception as e:
         log.exception("Telegram send failed: %s", e)
 
@@ -29,13 +31,15 @@ def send_message(chat_id, text):
 def get_odds(limit=6):
     if not ODDS_API_KEY:
         return []
+
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "eu",
         "markets": "h2h,totals",
         "oddsFormat": "decimal",
-        "dateFormat": "iso",
+        "dateFormat": "iso"
     }
+
     try:
         r = requests.get(ODDS_API_URL, params=params, timeout=20)
         r.raise_for_status()
@@ -48,11 +52,13 @@ def get_odds(limit=6):
 
 def build_matches_text(matches):
     lines = []
+
     for m in matches:
         home = str(m.get("home_team", "?"))
         away = str(m.get("away_team", "?"))
         commence = str(m.get("commence_time", "?"))
         line = home + " vs " + away + " (" + commence + ")"
+
         bookmakers = m.get("bookmakers", [])
         if bookmakers:
             try:
@@ -63,93 +69,106 @@ def build_matches_text(matches):
                 line = line + " | Odds: " + ", ".join(parts)
             except Exception:
                 pass
+
         lines.append(line)
-    return chr(10).join(lines) if lines else "No upcoming matches found."
+
+    if lines:
+        return chr(10).join(lines)
+
+    return "No upcoming matches found."
 
 
-def ask_gemini(prompt):
-    if not GEMINI_API_KEY:
-        return "Gemini API key missing in Render environment variables."
+def ask_ai(prompt):
+    if not OPENROUTER_API_KEY:
+        return "OpenRouter API key missing in Render environment variables."
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": "Bearer " + OPENROUTER_API_KEY,
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://render.com",
+        "X-Title": "telegram-football-bot"
+    }
 
     payload = {
-        "contents": [
+        "model": "openrouter/auto",
+        "messages": [
             {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
+                "role": "system",
+                "content": "You are a careful football betting analyst. Never promise certainty. Keep answers practical and short."
+            },
+            {
+                "role": "user",
+                "content": prompt
             }
         ]
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-    }
-
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        r = requests.post(url, headers=headers, json=payload, timeout=40)
+
         if r.status_code != 200:
-            log.error("Gemini status=%s body=%s", r.status_code, r.text)
-            return "Gemini error " + str(r.status_code) + ": " + r.text[:500]
+            return "OpenRouter error " + str(r.status_code) + ": " + r.text[:400]
 
         data = r.json()
+        choices = data.get("choices", [])
 
-        candidates = data.get("candidates", [])
-        if not candidates:
-            return "Gemini returned no candidates: " + json.dumps(data)[:500]
+        if not choices:
+            return "OpenRouter returned no choices."
 
-        content = candidates[0].get("content", {})
-        parts = content.get("parts", [])
-        if not parts:
-            return "Gemini returned no text parts: " + json.dumps(data)[:500]
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
 
-        text = parts[0].get("text", "")
-        if not text:
-            return "Gemini returned empty text: " + json.dumps(data)[:500]
+        if not content:
+            return "OpenRouter returned empty content."
 
-        return text
+        return content
 
     except Exception as e:
-        log.exception("Gemini API failed: %s", e)
-        return "Gemini request exception: " + str(e)
+        log.exception("OpenRouter failed: %s", e)
+        return "OpenRouter request failed: " + str(e)
+
 
 def predict_today_text():
     matches = get_odds(6)
     matches_text = build_matches_text(matches)
+
     if matches_text == "No upcoming matches found.":
         return matches_text
-    prompt = "You are a football betting analyst. Use only the odds data below. Pick the 3 best betting angles for today. For each give match, market, confidence and one short reason. Do not promise certainty." + chr(10) + chr(10) + matches_text
-    result = ask_gemini(prompt)
+
+    prompt = "Use only the football odds data below. Pick the 3 best betting angles for today. For each one give match, market, confidence and one short reason. Do not promise certainty." + chr(10) + chr(10) + matches_text
+    result = ask_ai(prompt)
     return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
 def predict_now_text():
     matches = get_odds(8)
     matches_text = build_matches_text(matches)
+
     if matches_text == "No upcoming matches found.":
         return matches_text
-    prompt = "You are a football betting analyst. From the odds data below, give short picks for matches starting soon. Keep it practical and careful." + chr(10) + chr(10) + matches_text
-    result = ask_gemini(prompt)
+
+    prompt = "From the football odds data below, give short picks for matches starting soon. Keep it practical and careful." + chr(10) + chr(10) + matches_text
+    result = ask_ai(prompt)
     return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
 def value_bets_text():
     matches = get_odds(8)
     matches_text = build_matches_text(matches)
+
     if matches_text == "No upcoming matches found.":
         return matches_text
-    prompt = "You are a sharp football bettor. Using the odds below, flag possible value bets and explain briefly why the odds may be interesting. Avoid certainty." + chr(10) + chr(10) + matches_text
-    result = ask_gemini(prompt)
+
+    prompt = "Using the football odds below, flag possible value bets and explain briefly why the odds may be interesting. Avoid certainty." + chr(10) + chr(10) + matches_text
+    result = ask_ai(prompt)
     return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
 def simple_ai_text(user_text, mode_name):
-    prompt = "You are a football analyst. Give a short and practical answer for " + mode_name + " about: " + user_text
-    result = ask_gemini(prompt)
+    prompt = "Give a short and practical football analysis for " + mode_name + " about: " + user_text
+    result = ask_ai(prompt)
     return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
 
 
@@ -166,12 +185,16 @@ def webhook():
     try:
         update = request.get_json(force=True, silent=True) or {}
         log.info("Incoming update: %s", json.dumps(update))
+
         message = update.get("message", {})
         chat_id = message.get("chat", {}).get("id")
         text = (message.get("text") or "").strip()
+
         if not chat_id:
             return jsonify(ok=True)
+
         lower = text.lower()
+
         if lower.startswith("/start"):
             reply = "Bot connected. Send /help"
         elif lower.startswith("/help"):
@@ -198,8 +221,10 @@ def webhook():
             reply = simple_ai_text(query_text, "head to head")
         else:
             reply = "Unknown command. Send /help"
+
         send_message(chat_id, reply)
         return jsonify(ok=True)
+
     except Exception as e:
         log.exception("Webhook error: %s", e)
         return jsonify(ok=False, error=str(e)), 500
