@@ -5,16 +5,19 @@ import requests
 from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("predict-bot")
+log = logging.getLogger("ultimate-football-bot")
 app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "changeme")
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 TELEGRAM_API = "https://api.telegram.org/bot" + TELEGRAM_TOKEN
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/soccer/odds"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def send_message(chat_id, text):
@@ -28,7 +31,7 @@ def send_message(chat_id, text):
         log.exception("Telegram send failed: %s", e)
 
 
-def get_odds(limit=6):
+def get_odds(limit=12):
     if not ODDS_API_KEY:
         return []
 
@@ -41,54 +44,120 @@ def get_odds(limit=6):
     }
 
     try:
-        r = requests.get(ODDS_API_URL, params=params, timeout=20)
-        r.raise_for_status()
+        r = requests.get(ODDS_API_URL, params=params, timeout=25)
+
+        if r.status_code != 200:
+            log.error("Odds API status=%s body=%s", r.status_code, r.text)
+            return []
+
         data = r.json()
         return data[:limit] if isinstance(data, list) else []
+
     except Exception as e:
         log.exception("Odds API failed: %s", e)
         return []
 
 
-def build_matches_text(matches):
+def build_match_lines(matches):
     lines = []
 
-    for m in matches:
+    for idx, m in enumerate(matches, 1):
         home = str(m.get("home_team", "?"))
         away = str(m.get("away_team", "?"))
         commence = str(m.get("commence_time", "?"))
-        line = home + " vs " + away + " (" + commence + ")"
+
+        line = str(idx) + ". " + home + " vs " + away + " | kickoff: " + commence
 
         bookmakers = m.get("bookmakers", [])
         if bookmakers:
             try:
-                outcomes = bookmakers[0]["markets"][0]["outcomes"]
-                parts = []
-                for o in outcomes:
-                    parts.append(str(o.get("name")) + ": " + str(o.get("price")))
-                line = line + " | Odds: " + ", ".join(parts)
+                markets = bookmakers[0].get("markets", [])
+
+                if len(markets) > 0:
+                    outcomes = markets[0].get("outcomes", [])
+                    parts = []
+                    for o in outcomes:
+                        parts.append(str(o.get("name")) + "=" + str(o.get("price")))
+                    if parts:
+                        line = line + " | h2h: " + ", ".join(parts)
+
+                if len(markets) > 1:
+                    totals = markets[1].get("outcomes", [])
+                    tparts = []
+                    for t in totals:
+                        name = str(t.get("name"))
+                        point = str(t.get("point"))
+                        price = str(t.get("price"))
+                        tparts.append(name + " " + point + "=" + price)
+                    if tparts:
+                        line = line + " | totals: " + ", ".join(tparts)
+
             except Exception:
                 pass
 
         lines.append(line)
 
-    if lines:
-        return chr(10).join(lines)
-
-    return "No upcoming matches found."
+    return chr(10).join(lines)
 
 
-def ask_ai(prompt):
+def ask_gemini(prompt):
+    if not GEMINI_API_KEY:
+        return None
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY
+    }
+
+    try:
+        r = requests.post(GEMINI_URL, headers=headers, json=payload, timeout=40)
+
+        if r.status_code != 200:
+            log.error("Gemini status=%s body=%s", r.status_code, r.text)
+            return None
+
+        data = r.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            return None
+
+        content = candidates[0].get("content", {})
+        parts = content.get("parts", [])
+        if not parts:
+            return None
+
+        text = parts[0].get("text", "")
+        if not text:
+            return None
+
+        return text
+
+    except Exception as e:
+        log.exception("Gemini failed: %s", e)
+        return None
+
+
+def ask_openrouter(prompt):
     if not OPENROUTER_API_KEY:
-        return "OpenRouter API key missing in Render environment variables."
-
-    url = "https://openrouter.ai/api/v1/chat/completions"
+        return None
 
     headers = {
         "Authorization": "Bearer " + OPENROUTER_API_KEY,
         "Content-Type": "application/json",
         "HTTP-Referer": "https://render.com",
-        "X-Title": "telegram-football-bot"
+        "X-Title": "ultimate-football-bot"
     }
 
     payload = {
@@ -96,7 +165,7 @@ def ask_ai(prompt):
         "messages": [
             {
                 "role": "system",
-                "content": "You are a careful football betting analyst. Never promise certainty. Keep answers practical and short."
+                "content": "You are a premium football betting analyst. Be realistic, sharp, and detailed. Never promise certainty."
             },
             {
                 "role": "user",
@@ -106,73 +175,145 @@ def ask_ai(prompt):
     }
 
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=40)
+        r = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=40)
 
         if r.status_code != 200:
-            return "OpenRouter error " + str(r.status_code) + ": " + r.text[:400]
+            log.error("OpenRouter status=%s body=%s", r.status_code, r.text)
+            return None
 
         data = r.json()
         choices = data.get("choices", [])
-
         if not choices:
-            return "OpenRouter returned no choices."
+            return None
 
         message = choices[0].get("message", {})
         content = message.get("content", "")
-
         if not content:
-            return "OpenRouter returned empty content."
+            return None
 
         return content
 
     except Exception as e:
         log.exception("OpenRouter failed: %s", e)
-        return "OpenRouter request failed: " + str(e)
+        return None
 
 
-def predict_today_text():
-    matches = get_odds(6)
-    matches_text = build_matches_text(matches)
+def ask_ai(prompt):
+    gemini_result = ask_gemini(prompt)
+    if gemini_result:
+        return gemini_result
 
-    if matches_text == "No upcoming matches found.":
-        return matches_text
+    openrouter_result = ask_openrouter(prompt)
+    if openrouter_result:
+        return openrouter_result
 
-    prompt = "Use only the football odds data below. Pick the 3 best betting angles for today. For each one give match, market, confidence and one short reason. Do not promise certainty." + chr(10) + chr(10) + matches_text
-    result = ask_ai(prompt)
-    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
+    return "Both Gemini and OpenRouter failed. Check your API keys or quotas."
+
+
+def no_data_text():
+    return "No matches found right now or odds API unavailable."
+
+
+def luxury_prompt(mode_name, match_block):
+    intro = "You are Football Intelligence Bot, a premium football analyst. Write like an elite paid research assistant. Be realistic, polished, detailed, and structured. Never promise certainty."
+
+    if mode_name == "today":
+        body = "Using only the football odds data below plus careful reasoning, produce a luxury today report. For each match include: match title, likely score, win draw probabilities in percentages, tactical strengths and weaknesses, injury or suspension note as assumed if unknown, and betting insight. Use elegant formatting with separators."
+    elif mode_name == "banker":
+        body = "Using the football odds data below, choose the safest single bet of the day. Give match, exact market, confidence, detailed reasoning, and one backup banker."
+    elif mode_name == "acca":
+        body = "Using the football odds data below, build one smart 3-leg accumulator with safer logic. Give each leg, reason, and one caution note."
+    elif mode_name == "goals":
+        body = "Using the football odds data below, analyze over under 2.5 goals for the listed matches. For each one give the best lean, confidence, likely score and short logic."
+    elif mode_name == "predict":
+        body = "Using the football odds data below, produce a deep premium pre-match analysis for the listed fixtures. Include likely score, probabilities, tactical angle, risk note, and betting insight."
+    elif mode_name == "predict_now":
+        body = "Using the football odds data below, create a live style momentum report for the listed fixtures. Mention likely pressure direction, next goal lean, and smart market angle, while clearly staying cautious if live information is limited."
+    elif mode_name == "standings":
+        body = "Give a concise major-league standings style overview, but clearly mention that this is a general AI summary because no standings API is connected."
+    elif mode_name == "usdt":
+        body = "Explain briefly how to check USDT DZD manually and mention that a direct live parser is not connected in this bot."
+    else:
+        body = "Analyze the football odds data below in a premium and realistic way."
+
+    return intro + chr(10) + chr(10) + body + chr(10) + chr(10) + "MATCH DATA:" + chr(10) + match_block
+
+
+def today_text():
+    matches = get_odds(10)
+    if not matches:
+        return no_data_text()
+    prompt = luxury_prompt("today", build_match_lines(matches))
+    return ask_ai(prompt)
+
+
+def banker_text():
+    matches = get_odds(10)
+    if not matches:
+        return no_data_text()
+    prompt = luxury_prompt("banker", build_match_lines(matches))
+    return ask_ai(prompt)
+
+
+def acca_text():
+    matches = get_odds(10)
+    if not matches:
+        return no_data_text()
+    prompt = luxury_prompt("acca", build_match_lines(matches))
+    return ask_ai(prompt)
+
+
+def goals_text():
+    matches = get_odds(10)
+    if not matches:
+        return no_data_text()
+    prompt = luxury_prompt("goals", build_match_lines(matches))
+    return ask_ai(prompt)
+
+
+def predict_text():
+    matches = get_odds(10)
+    if not matches:
+        return no_data_text()
+    prompt = luxury_prompt("predict", build_match_lines(matches))
+    return ask_ai(prompt)
 
 
 def predict_now_text():
-    matches = get_odds(8)
-    matches_text = build_matches_text(matches)
-
-    if matches_text == "No upcoming matches found.":
-        return matches_text
-
-    prompt = "From the football odds data below, give short picks for matches starting soon. Keep it practical and careful." + chr(10) + chr(10) + matches_text
-    result = ask_ai(prompt)
-    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
+    matches = get_odds(10)
+    if not matches:
+        return no_data_text()
+    prompt = luxury_prompt("predict_now", build_match_lines(matches))
+    return ask_ai(prompt)
 
 
-def value_bets_text():
-    matches = get_odds(8)
-    matches_text = build_matches_text(matches)
-
-    if matches_text == "No upcoming matches found.":
-        return matches_text
-
-    prompt = "Using the football odds below, flag possible value bets and explain briefly why the odds may be interesting. Avoid certainty." + chr(10) + chr(10) + matches_text
-    result = ask_ai(prompt)
-    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
+def standings_text():
+    prompt = luxury_prompt("standings", "No standings API connected.")
+    return ask_ai(prompt)
 
 
-def simple_ai_text(user_text, mode_name):
-    prompt = "Give a short and practical football analysis for " + mode_name + " about: " + user_text
-    result = ask_ai(prompt)
-    return result + chr(10) + chr(10) + "Warning: this is analysis, not guaranteed winning advice."
+def usdt_text():
+    prompt = luxury_prompt("usdt", "No live USDT parser connected.")
+    return ask_ai(prompt)
 
 
-HELP_TEXT = "Commands: /start /help /ping /predict_today /predict_now /value_bets /corners team1 vs team2 /cards team1 vs team2 /form team /h2h team1 vs team2"
+HELP_TEXT = "Football Intelligence Bot
+Powered by AI + odds data
+==========================================
+
+COMMANDS
+
+/banker      — Best single bet of the day
+/acca        — 3-leg accumulator / parlay
+/goals       — Over / Under 2.5 goals analysis
+/predict     — Deep pre-match analysis
+/predict_now — Live scores & momentum update
+/today       — Full list of today's fixtures
+/standings   — Current major league tables
+/usdt        — USDT/DZD rate guidance
+
+==========================================
+Responses may take 10–20 seconds — please be patient."
 
 
 @app.route("/", methods=["GET"])
@@ -195,30 +336,24 @@ def webhook():
 
         lower = text.lower()
 
-        if lower.startswith("/start"):
-            reply = "Bot connected. Send /help"
-        elif lower.startswith("/help"):
+        if lower.startswith("/start") or lower.startswith("/help"):
             reply = HELP_TEXT
-        elif lower.startswith("/ping"):
-            reply = "pong"
-        elif lower.startswith("/predict_today"):
-            reply = predict_today_text()
+        elif lower.startswith("/banker"):
+            reply = banker_text()
+        elif lower.startswith("/acca"):
+            reply = acca_text()
+        elif lower.startswith("/goals"):
+            reply = goals_text()
         elif lower.startswith("/predict_now"):
             reply = predict_now_text()
-        elif lower.startswith("/value_bets"):
-            reply = value_bets_text()
-        elif lower.startswith("/corners"):
-            query_text = text.replace("/corners", "").strip() or "general matches today"
-            reply = simple_ai_text(query_text, "corners")
-        elif lower.startswith("/cards"):
-            query_text = text.replace("/cards", "").strip() or "general matches today"
-            reply = simple_ai_text(query_text, "cards")
-        elif lower.startswith("/form"):
-            query_text = text.replace("/form", "").strip() or "general team"
-            reply = simple_ai_text(query_text, "recent form")
-        elif lower.startswith("/h2h"):
-            query_text = text.replace("/h2h", "").strip() or "general matchup"
-            reply = simple_ai_text(query_text, "head to head")
+        elif lower.startswith("/predict"):
+            reply = predict_text()
+        elif lower.startswith("/today"):
+            reply = today_text()
+        elif lower.startswith("/standings"):
+            reply = standings_text()
+        elif lower.startswith("/usdt"):
+            reply = usdt_text()
         else:
             reply = "Unknown command. Send /help"
 
