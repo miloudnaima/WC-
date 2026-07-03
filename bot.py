@@ -297,24 +297,7 @@ def usdt_text():
     return ask_ai(prompt)
 
 
-HELP_TEXT = "Football Intelligence Bot
-Powered by AI + odds data
-==========================================
-
-COMMANDS
-
-/banker      — Best single bet of the day
-/acca        — 3-leg accumulator / parlay
-/goals       — Over / Under 2.5 goals analysis
-/predict     — Deep pre-match analysis
-/predict_now — Live scores & momentum update
-/today       — Full list of today's fixtures
-/standings   — Current major league tables
-/usdt        — USDT/DZD rate guidance
-
-==========================================
-Responses may take 10–20 seconds — please be patient."
-
+HELP_TEXT = "Football Intelligence Bot | /banker best single bet | /acca 3-leg parlay | /goals over-under 2.5 analysis | /predict deep pre-match analysis | /predict_now live style update | /today full fixtures | /standings major league tables | /usdt USDT DZD guidance"
 
 @app.route("/", methods=["GET"])
 def home():
