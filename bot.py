@@ -48,6 +48,7 @@ COOLDOWN_SECONDS = 8
 SPAM_WINDOW_SECONDS = 20
 SPAM_MAX_REQUESTS = 6
 MATCH_WINDOW_HOURS = 24
+PAST_GRACE_HOURS = 3
 MAX_PAGE_SIZE = 3
 ODDS_SPORT_FILTER = {"soccer"}
 
@@ -436,12 +437,13 @@ def build_score_map(stats: dict[str, float]) -> dict[str, float]:
 def upcoming_match_insights() -> list[MatchInsight]:
     now = datetime.now(UTC)
     cutoff = now + timedelta(hours=MATCH_WINDOW_HOURS)
+    past_cutoff = now - timedelta(hours=PAST_GRACE_HOURS)
     insights: list[MatchInsight] = []
     raw_events = get_upcoming_odds()
     log_odds_debug("raw_soccer_events_before_time_filter", raw_events)
     for event in raw_events:
         kickoff = parse_iso_time(str(event.get("commence_time", "")))
-        if not kickoff or kickoff < now or kickoff > cutoff:
+        if not kickoff or kickoff < past_cutoff or kickoff > cutoff:
             continue
         bookmaker, markets = select_bookmaker(event)
         if "h2h" not in markets:
@@ -598,7 +600,7 @@ def build_prediction_message(mode: str, insights: list[MatchInsight], page: int 
     ordered = sort_insights(insights, mode)
     if not ordered:
         return (
-            "No football matches were returned by The Odds API right now. I checked the upcoming endpoint and soccer sport feeds and still got nothing.",
+            f"No football matches were available between the last {PAST_GRACE_HOURS} hours and the next {MATCH_WINDOW_HOURS} hours from The Odds API.",
             main_menu_keyboard(),
         )
     total_pages = max(1, (len(ordered) + MAX_PAGE_SIZE - 1) // MAX_PAGE_SIZE)
