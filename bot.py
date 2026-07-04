@@ -23,6 +23,7 @@ class Settings:
     telegram_token: str = os.getenv("TELEGRAM_TOKEN", "").strip()
     webhook_secret: str = os.getenv("WEBHOOK_SECRET", "").strip()
     odds_api_key: str = os.getenv("ODDS_API_KEY", "").strip()
+    football_api_key: str = os.getenv("FOOTBALL_API_KEY", "").strip()
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "").strip()
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", os.getenv("ROUTER_API_KEY", "")).strip()
 
@@ -39,6 +40,7 @@ settings.validate()
 TELEGRAM_API = f"https://api.telegram.org/bot{settings.telegram_token}"
 ODDS_SPORTS_URL = "https://api.the-odds-api.com/v4/sports"
 ODDS_UPCOMING_URL = "https://api.the-odds-api.com/v4/sports/upcoming/odds"
+API_FOOTBALL_FIXTURES_URL = "https://v3.football.api-sports.io/fixtures"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_TIMEOUT = 20
@@ -49,7 +51,7 @@ SPAM_WINDOW_SECONDS = 20
 SPAM_MAX_REQUESTS = 8
 MATCH_WINDOW_HOURS = 48
 PAST_GRACE_HOURS = 6
-MAX_PAGE_SIZE = 3
+MAX_PAGE_SIZE = 5
 BOOKMAKER_SCAN_LIMIT = 8
 
 
@@ -96,7 +98,7 @@ cache = TTLCache()
 ai_cache = TTLCache()
 rate_limiter = RateLimiter()
 session = requests.Session()
-session.headers.update({"User-Agent": "smart-football-bot/4.0"})
+session.headers.update({"User-Agent": "smart-football-bot/5.0"})
 
 
 @dataclass(slots=True)
@@ -194,11 +196,7 @@ def retry_request(method: str, url: str, *, params: dict[str, Any] | None = None
 
 class TelegramClient:
     def send_message(self, chat_id: int, text: str, reply_markup: dict[str, Any] | None = None) -> None:
-        payload: dict[str, Any] = {
-            "chat_id": chat_id,
-            "text": text[:4096],
-            "disable_web_page_preview": True,
-        }
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text[:4096], "disable_web_page_preview": True}
         if reply_markup:
             payload["reply_markup"] = reply_markup
         retry_request("POST", f"{TELEGRAM_API}/sendMessage", json_body=payload, timeout=15)
@@ -229,7 +227,7 @@ def log_odds_debug(label: str, events: list[dict[str, Any]]) -> None:
     log.info("%s count=%s preview=%s", label, len(events), json.dumps(preview)[:1500])
 
 
-def get_sport_keys() -> list[str]:
+def get_odds_sport_keys() -> list[str]:
     cached = cache.get("odds:sport_keys")
     if cached is not None:
         return cached
@@ -246,7 +244,7 @@ def get_sport_keys() -> list[str]:
     return keys
 
 
-def fetch_events_for_sport(sport_key: str) -> list[dict[str, Any]]:
+def fetch_odds_events_for_sport(sport_key: str) -> list[dict[str, Any]]:
     cache_key = f"odds:sport:{sport_key}"
     cached = cache.get(cache_key)
     if cached is not None:
@@ -272,13 +270,12 @@ def fetch_events_for_sport(sport_key: str) -> list[dict[str, Any]]:
     return events
 
 
-def get_upcoming_odds() -> list[dict[str, Any]]:
+def get_odds_events() -> list[dict[str, Any]]:
     cached = cache.get("odds:upcoming")
     if cached is not None:
         return cached
     if not settings.odds_api_key:
         return []
-
     all_events: list[dict[str, Any]] = []
     response = retry_request(
         "GET",
@@ -298,25 +295,46 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
         soccer_from_upcoming = [event for event in events if str(event.get("sport_key", "")).startswith("soccer_")]
         log_odds_debug("upcoming_soccer_events", soccer_from_upcoming)
         all_events.extend(soccer_from_upcoming)
-    else:
-        log.warning("Upcoming odds status=%s body=%s", response.status_code, response.text[:600])
-
     if not all_events:
-        sport_keys = get_sport_keys()[:20]
+        sport_keys = get_odds_sport_keys()[:20]
         log.info("soccer sport keys=%s", sport_keys)
         for sport_key in sport_keys:
-            sport_events = fetch_events_for_sport(sport_key)
+            sport_events = fetch_odds_events_for_sport(sport_key)
             log_odds_debug(f"sport_feed:{sport_key}", sport_events)
             all_events.extend(sport_events)
-
     deduped: dict[str, dict[str, Any]] = {}
     for event in all_events:
         event_id = str(event.get("id") or f"{event.get('home_team', '')}-{event.get('away_team', '')}-{event.get('commence_time', '')}")
         deduped[event_id] = event
+    result = list(deduped.values())
+    cache.set("odds:upcoming", result, CACHE_TTL_SECONDS)
+    return result
 
-    soccer_events = list(deduped.values())
-    cache.set("odds:upcoming", soccer_events, CACHE_TTL_SECONDS)
-    return soccer_events
+
+def get_fixture_events() -> list[dict[str, Any]]:
+    cached = cache.get("fixtures:upcoming")
+    if cached is not None:
+        return cached
+    if not settings.football_api_key:
+        return []
+    now = datetime.now(UTC)
+    start_date = (now - timedelta(hours=PAST_GRACE_HOURS)).strftime("%Y-%m-%d")
+    end_date = (now + timedelta(hours=MATCH_WINDOW_HOURS)).strftime("%Y-%m-%d")
+    response = retry_request(
+        "GET",
+        API_FOOTBALL_FIXTURES_URL,
+        params={"from": start_date, "to": end_date, "timezone": "UTC"},
+        headers={"x-apisports-key": settings.football_api_key},
+        timeout=25,
+    )
+    if response.status_code != 200:
+        log.warning("API-Football fixtures status=%s body=%s", response.status_code, response.text[:600])
+        return []
+    payload = response.json()
+    events = payload.get("response", []) if isinstance(payload, dict) else []
+    cache.set("fixtures:upcoming", events, CACHE_TTL_SECONDS)
+    log.info("api_football_fixtures count=%s", len(events))
+    return events
 
 
 def choose_best_bookmaker(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -372,7 +390,6 @@ def build_support_stats(markets: dict[str, Any], home_team: str, away_team: str)
     over15 = find_price(markets.get("totals"), ["over"], 1.5)
     under15 = find_price(markets.get("totals"), ["under"], 1.5)
     btts_yes, btts_no = estimate_btts_from_totals(over25, under25)
-
     home_prob = implied_probability(home_price)
     draw_prob = implied_probability(draw_price)
     away_prob = implied_probability(away_price)
@@ -381,7 +398,6 @@ def build_support_stats(markets: dict[str, Any], home_team: str, away_team: str)
         home_prob /= total
         draw_prob /= total
         away_prob /= total
-
     return {
         "home_price": home_price or 0.0,
         "draw_price": draw_price or 0.0,
@@ -435,15 +451,95 @@ def build_score_map(stats: dict[str, float]) -> dict[str, float]:
     }
 
 
-def upcoming_match_insights() -> list[MatchInsight]:
+def merge_fixture_with_odds(fixtures: list[dict[str, Any]], odds_events: list[dict[str, Any]]) -> list[MatchInsight]:
+    odds_index: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in odds_events:
+        home = str(event.get("home_team", "")).strip().lower()
+        away = str(event.get("away_team", "")).strip().lower()
+        if home and away:
+            odds_index[(home, away)] = event
+            odds_index[(away, home)] = event
+
+    insights: list[MatchInsight] = []
     now = datetime.now(UTC)
     cutoff = now + timedelta(hours=MATCH_WINDOW_HOURS)
     past_cutoff = now - timedelta(hours=PAST_GRACE_HOURS)
-    raw_events = get_upcoming_odds()
-    log_odds_debug("raw_soccer_events_before_time_filter", raw_events)
-    insights: list[MatchInsight] = []
 
-    for event in raw_events:
+    for fixture in fixtures:
+        fixture_info = fixture.get("fixture", {})
+        teams = fixture.get("teams", {})
+        league = fixture.get("league", {})
+        home_team = str(teams.get("home", {}).get("name", "Unknown"))
+        away_team = str(teams.get("away", {}).get("name", "Unknown"))
+        kickoff_utc = str(fixture_info.get("date", ""))
+        kickoff = parse_iso_time(kickoff_utc)
+        if not kickoff or kickoff < past_cutoff or kickoff > cutoff:
+            continue
+
+        matched_odds = odds_index.get((home_team.lower(), away_team.lower()))
+        bookmaker = "No odds"
+        markets: dict[str, Any] = {}
+        if matched_odds:
+            bookmaker, markets = choose_best_bookmaker(matched_odds)
+
+        support = build_support_stats(markets, home_team, away_team) if markets else {
+            "home_price": 0.0,
+            "draw_price": 0.0,
+            "away_price": 0.0,
+            "over25": 0.0,
+            "under25": 0.0,
+            "over15": 0.0,
+            "under15": 0.0,
+            "btts_yes": 0.0,
+            "btts_no": 0.0,
+            "home_prob": 0.34,
+            "draw_prob": 0.28,
+            "away_prob": 0.38,
+            "over25_prob": 0.50,
+            "under25_prob": 0.50,
+            "over15_prob": 0.64,
+            "under15_prob": 0.36,
+            "btts_yes_prob": 0.51,
+            "btts_no_prob": 0.49,
+        }
+
+        insights.append(MatchInsight(
+            match_id=str(fixture_info.get("id") or f"{home_team}-{away_team}-{kickoff_utc}"),
+            competition=str(league.get("name", "Football")),
+            kickoff_utc=kickoff_utc,
+            home_team=home_team,
+            away_team=away_team,
+            bookmaker=bookmaker,
+            odds_home=support["home_price"] or None,
+            odds_draw=support["draw_price"] or None,
+            odds_away=support["away_price"] or None,
+            totals_over_25=support["over25"] or None,
+            totals_under_25=support["under25"] or None,
+            btts_yes=support["btts_yes"] or None,
+            btts_no=support["btts_no"] or None,
+            totals_over_15=support["over15"] or None,
+            totals_under_15=support["under15"] or None,
+            score_map=build_score_map(support),
+            support_stats=support,
+        ))
+
+    insights.sort(key=lambda item: item.kickoff_utc)
+    log.info("merged fixture insights count=%s", len(insights))
+    return insights
+
+
+def upcoming_match_insights() -> list[MatchInsight]:
+    fixtures = get_fixture_events()
+    odds_events = get_odds_events()
+    log_odds_debug("raw_soccer_events_before_merge", odds_events)
+    if fixtures:
+        return merge_fixture_with_odds(fixtures, odds_events)
+
+    now = datetime.now(UTC)
+    cutoff = now + timedelta(hours=MATCH_WINDOW_HOURS)
+    past_cutoff = now - timedelta(hours=PAST_GRACE_HOURS)
+    insights: list[MatchInsight] = []
+    for event in odds_events:
         kickoff = parse_iso_time(str(event.get("commence_time", "")))
         if not kickoff or kickoff < past_cutoff or kickoff > cutoff:
             continue
@@ -472,9 +568,8 @@ def upcoming_match_insights() -> list[MatchInsight]:
             score_map=build_score_map(support),
             support_stats=support,
         ))
-
     insights.sort(key=lambda item: item.kickoff_utc)
-    log.info("match insights count=%s", len(insights))
+    log.info("odds-only match insights count=%s", len(insights))
     return insights
 
 
@@ -551,7 +646,6 @@ def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) ->
     for insight, pick in picks:
         prompt_items.append({"match_id": insight.match_id, "match": f"{insight.home_team} vs {insight.away_team}", "market": pick["market"], "recommended_bet": pick["bet"], "odds": pick["odds"], "support": insight.support_stats})
     instruction = "Use only the supplied market data. Do not invent xG, injuries, possession, form, head-to-head, or live stats. Return pure JSON mapping match_id to one short reason sentence."
-
     if settings.gemini_api_key:
         try:
             response = retry_request("POST", GEMINI_URL, headers={"Content-Type": "application/json", "x-goog-api-key": settings.gemini_api_key}, json_body={"contents": [{"parts": [{"text": instruction + "\n\n" + json.dumps(prompt_items, ensure_ascii=False)}]}], "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}, timeout=25)
@@ -564,7 +658,6 @@ def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) ->
                     return parsed
         except Exception as exc:
             log.warning("Gemini reasoning failed: %s", exc)
-
     if settings.openrouter_api_key:
         try:
             response = retry_request("POST", OPENROUTER_URL, headers={"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json", "HTTP-Referer": "https://render.com", "X-Title": "smart-football-bot"}, json_body={"model": "openrouter/auto", "messages": [{"role": "system", "content": instruction}, {"role": "user", "content": json.dumps(prompt_items, ensure_ascii=False)}], "temperature": 0.2, "response_format": {"type": "json_object"}}, timeout=25)
@@ -577,8 +670,7 @@ def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) ->
                     return parsed
         except Exception as exc:
             log.warning("OpenRouter reasoning failed: %s", exc)
-
-    fallback = {item[0].match_id: "This angle follows the current bookmaker pricing and market balance only." for item in picks}
+    fallback = {item[0].match_id: "This angle follows the available pricing and market balance only." for item in picks}
     ai_cache.set(cache_key, fallback, AI_CACHE_TTL_SECONDS)
     return fallback
 
@@ -592,7 +684,7 @@ def sort_insights(insights: list[MatchInsight], mode: str) -> list[MatchInsight]
 def build_prediction_message(mode: str, insights: list[MatchInsight], page: int = 0) -> tuple[str, dict[str, Any]]:
     ordered = sort_insights(insights, mode)
     if not ordered:
-        return (f"No football matches were available between the last {PAST_GRACE_HOURS} hours and the next {MATCH_WINDOW_HOURS} hours from The Odds API.", main_menu_keyboard())
+        return (f"No football matches were available between the last {PAST_GRACE_HOURS} hours and the next {MATCH_WINDOW_HOURS} hours.", main_menu_keyboard())
     total_pages = max(1, (len(ordered) + MAX_PAGE_SIZE - 1) // MAX_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     selected = ordered[page * MAX_PAGE_SIZE:(page + 1) * MAX_PAGE_SIZE]
@@ -604,18 +696,18 @@ def build_prediction_message(mode: str, insights: list[MatchInsight], page: int 
         odds_text = f"{pick['odds']:.2f}" if isinstance(pick['odds'], (int, float)) and pick['odds'] > 0 else "N/A"
         lines.extend([
             "",
-            f"âš½ {insight.home_team} vs {insight.away_team}",
-            f"ðŸ† {insight.competition}",
-            f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
-            f"ðŸŽ¯ Market: {pick['market']}",
-            f"âœ… Bet: {pick['bet']}",
-            f"ðŸ”¥ Confidence: {pick['confidence']}%",
-            f"ðŸ“Š Stats: {pick['support']}",
-            f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
-            f"âš ï¸ Risk: {pick['risk']}",
-            f"â­ Value: {pick['value']}",
-            f"ðŸŽšï¸ Stake: {pick['stake']}/10",
-            f"ðŸ§  Why: {ai_notes.get(insight.match_id, 'This angle follows the current bookmaker pricing and market balance only.')}",
+            f"Match: {insight.home_team} vs {insight.away_team}",
+            f"Competition: {insight.competition}",
+            f"Kickoff: {format_kickoff(insight.kickoff_utc)}",
+            f"Market: {pick['market']}",
+            f"Bet: {pick['bet']}",
+            f"Confidence: {pick['confidence']}%",
+            f"Stats: {pick['support']}",
+            f"Odds: {odds_text} via {insight.bookmaker}",
+            f"Risk: {pick['risk']}",
+            f"Value: {pick['value']}",
+            f"Stake: {pick['stake']}/10",
+            f"Why: {ai_notes.get(insight.match_id, 'This angle follows the available pricing and market balance only.')}",
         ])
     return ("\n".join(lines), prediction_keyboard(mode, page, total_pages))
 
@@ -675,27 +767,27 @@ def find_match(insights: list[MatchInsight], left: str, right: str) -> MatchInsi
 
 def single_match_text(insight: MatchInsight, mode: str) -> str:
     pick = pick_for_mode(insight, mode)
-    reason = ai_reasoning(mode, [(insight, pick)]).get(insight.match_id, "This angle follows the current bookmaker pricing and market balance only.")
+    reason = ai_reasoning(mode, [(insight, pick)]).get(insight.match_id, "This angle follows the available pricing and market balance only.")
     odds_text = f"{pick['odds']:.2f}" if isinstance(pick['odds'], (int, float)) and pick['odds'] > 0 else "N/A"
     return "\n".join([
-        f"âš½ {insight.home_team} vs {insight.away_team}",
-        f"ðŸ† {insight.competition}",
-        f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
-        f"ðŸŽ¯ Market: {pick['market']}",
-        f"âœ… Bet: {pick['bet']}",
-        f"ðŸ”¥ Confidence: {pick['confidence']}%",
-        f"ðŸ“Š Stats: {pick['support']}",
-        f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
-        f"âš ï¸ Risk: {pick['risk']}",
-        f"â­ Value: {pick['value']}",
-        f"ðŸŽšï¸ Stake: {pick['stake']}/10",
-        f"ðŸ§  Why: {reason}",
+        f"Match: {insight.home_team} vs {insight.away_team}",
+        f"Competition: {insight.competition}",
+        f"Kickoff: {format_kickoff(insight.kickoff_utc)}",
+        f"Market: {pick['market']}",
+        f"Bet: {pick['bet']}",
+        f"Confidence: {pick['confidence']}%",
+        f"Stats: {pick['support']}",
+        f"Odds: {odds_text} via {insight.bookmaker}",
+        f"Risk: {pick['risk']}",
+        f"Value: {pick['value']}",
+        f"Stake: {pick['stake']}/10",
+        f"Why: {reason}",
     ])
 
 
 def stats_text(insights: list[MatchInsight]) -> str:
     if not insights:
-        return "No odds data loaded right now."
+        return "No match data loaded right now."
     avg_home = round(sum(item.support_stats["home_prob"] for item in insights) / len(insights) * 100)
     over25_values = [item.support_stats["over25_prob"] for item in insights if item.support_stats["over25_prob"] > 0]
     btts_values = [item.support_stats["btts_yes_prob"] for item in insights if item.support_stats["btts_yes_prob"] > 0]
@@ -707,13 +799,13 @@ def stats_text(insights: list[MatchInsight]) -> str:
         f"Average favorite implied win rate: {avg_home}%",
         f"Average over 2.5 implied rate: {avg_over25}%",
         f"Average BTTS estimated rate: {avg_btts}%",
-        "Data source: The Odds API h2h, totals, and spreads only, with BTTS estimated from totals when needed.",
+        "Match list source: API-Football fixtures when available, with The Odds API merged in for pricing.",
     ])
 
 
 def handle_text_command(command: str, args: str, insights: list[MatchInsight]) -> tuple[str, dict[str, Any] | None]:
     if command == "start":
-        return ("Welcome to Football Intelligence Pro\n\nPremium betting assistant using Telegram, Odds API, Gemini, OpenRouter, and webhook only.", main_menu_keyboard())
+        return ("Welcome to Football Intelligence Pro\n\nPremium betting assistant using Telegram, API-Football, The Odds API, Gemini, OpenRouter, and webhook only.", main_menu_keyboard())
     if command in {"help", "menu"}:
         return (help_text(), main_menu_keyboard())
     if command in {"today", "live", "safe", "value", "acca", "corners", "cards", "goals", "btts", "over25", "under25", "firsthalf", "secondhalf"}:
@@ -727,7 +819,7 @@ def handle_text_command(command: str, args: str, insights: list[MatchInsight]) -
         if not matches:
             return (f"No upcoming fixtures found for {args}.", None)
         lines = [f"Fixtures for {args}:"]
-        for item in matches[:8]:
+        for item in matches[:10]:
             lines.append(f"- {item.home_team} vs {item.away_team} | {format_kickoff(item.kickoff_utc)}")
         return ("\n".join(lines), None)
     if command in {"match", "analyze"}:
@@ -767,7 +859,6 @@ def webhook() -> tuple[Any, int]:
     try:
         update = request.get_json(force=True, silent=True) or {}
         log.info("Incoming update: %s", json.dumps(update)[:2000])
-
         if "callback_query" in update:
             callback = update["callback_query"]
             callback_id = str(callback.get("id") or "")
@@ -787,26 +878,21 @@ def webhook() -> tuple[Any, int]:
                     text, keyboard = build_prediction_message(mode, insights, page)
                     telegram.send_message(chat_id, text, keyboard)
             return (jsonify({"ok": True}), 200)
-
         message = update.get("message") or update.get("edited_message") or {}
         chat_id = int(message.get("chat", {}).get("id", 0) or 0)
         if not chat_id:
             return (jsonify({"ok": True}), 200)
-
         user_id = str(message.get("from", {}).get("id", "0"))
         text = str(message.get("text") or "").strip()
         command, args = parse_command(text)
-
         if rate_limiter.is_spamming(user_id):
             telegram.send_message(chat_id, "Slow down. Too many requests in a short time.")
             return (jsonify({"ok": True}), 200)
-
         if command not in {"start", "help", "menu"}:
             remaining = rate_limiter.cooldown_remaining(f"{user_id}:{command}")
             if remaining > 0:
                 telegram.send_message(chat_id, f"Cooldown active. Please wait {remaining}s before /{command} again.")
                 return (jsonify({"ok": True}), 200)
-
         insights = upcoming_match_insights()
         text_out, keyboard = handle_text_command(command, args, insights)
         telegram.send_message(chat_id, text_out, keyboard)
