@@ -289,13 +289,19 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
     if response.status_code == 200:
         payload = response.json()
         events = payload if isinstance(payload, list) else []
-        all_events.extend([event for event in events if str(event.get("sport_key", "")).startswith("soccer_")])
+        soccer_from_upcoming = [event for event in events if str(event.get("sport_key", "")).startswith("soccer_")]
+        log_odds_debug("upcoming_soccer_events", soccer_from_upcoming)
+        all_events.extend(soccer_from_upcoming)
     else:
         log.warning("Upcoming odds status=%s body=%s", response.status_code, response.text[:600])
 
     if not all_events:
-        for sport_key in get_sport_keys()[:12]:
-            all_events.extend(fetch_events_for_sport(sport_key))
+        sport_keys = get_sport_keys()[:12]
+        log.info("soccer sport keys=%s", sport_keys)
+        for sport_key in sport_keys:
+            sport_events = fetch_events_for_sport(sport_key)
+            log_odds_debug(f"sport_feed:{sport_key}", sport_events)
+            all_events.extend(sport_events)
 
     deduped: dict[str, dict[str, Any]] = {}
     for event in all_events:
@@ -306,6 +312,20 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
     cache.set("odds:upcoming", soccer_events, CACHE_TTL_SECONDS)
     return soccer_events
 
+
+
+
+def log_odds_debug(label: str, events: list[dict[str, Any]]) -> None:
+    preview = []
+    for event in events[:5]:
+        preview.append({
+            "sport_key": event.get("sport_key"),
+            "home_team": event.get("home_team"),
+            "away_team": event.get("away_team"),
+            "commence_time": event.get("commence_time"),
+            "bookmakers": len(event.get("bookmakers", []) or []),
+        })
+    log.info("%s count=%s preview=%s", label, len(events), json.dumps(preview)[:1500])
 
 def select_bookmaker(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     bookmakers = event.get("bookmakers", []) or []
@@ -417,7 +437,9 @@ def upcoming_match_insights() -> list[MatchInsight]:
     now = datetime.now(UTC)
     cutoff = now + timedelta(hours=MATCH_WINDOW_HOURS)
     insights: list[MatchInsight] = []
-    for event in get_upcoming_odds():
+    raw_events = get_upcoming_odds()
+    log_odds_debug("raw_soccer_events_before_time_filter", raw_events)
+    for event in raw_events:
         kickoff = parse_iso_time(str(event.get("commence_time", "")))
         if not kickoff or kickoff < now or kickoff > cutoff:
             continue
@@ -449,6 +471,7 @@ def upcoming_match_insights() -> list[MatchInsight]:
             )
         )
     insights.sort(key=lambda item: item.kickoff_utc)
+    log.info("match insights count=%s", len(insights))
     return insights
 
 
