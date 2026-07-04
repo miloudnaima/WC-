@@ -37,7 +37,8 @@ settings = Settings()
 settings.validate()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{settings.telegram_token}"
-ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/upcoming/odds"
+ODDS_SPORTS_URL = "https://api.the-odds-api.com/v4/sports"
+ODDS_UPCOMING_URL = "https://api.the-odds-api.com/v4/sports/upcoming/odds"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_TIMEOUT = 20
@@ -224,26 +225,84 @@ class TelegramClient:
 telegram = TelegramClient()
 
 
+def get_sport_keys() -> list[str]:
+    cached = cache.get("odds:sport_keys")
+    if cached is not None:
+        return cached
+    if not settings.odds_api_key:
+        return []
+    response = retry_request(
+        "GET",
+        ODDS_SPORTS_URL,
+        params={"apiKey": settings.odds_api_key},
+        timeout=20,
+    )
+    if response.status_code != 200:
+        log.error("Odds sports status=%s body=%s", response.status_code, response.text[:1000])
+        return []
+    payload = response.json()
+    sports = payload if isinstance(payload, list) else []
+    keys = [str(item.get("key", "")) for item in sports if str(item.get("key", "")).startswith("soccer_") and not item.get("has_outrights", False)]
+    cache.set("odds:sport_keys", keys, CACHE_TTL_SECONDS)
+    return keys
+
+
+def fetch_events_for_sport(sport_key: str) -> list[dict[str, Any]]:
+    cache_key = f"odds:sport:{sport_key}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    params = {
+        "apiKey": settings.odds_api_key,
+        "regions": "eu,uk,us",
+        "markets": "h2h,totals,btts,spreads",
+        "oddsFormat": "decimal",
+        "dateFormat": "iso",
+    }
+    response = retry_request("GET", f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", params=params, timeout=20)
+    if response.status_code != 200:
+        log.warning("Odds fetch failed for %s status=%s body=%s", sport_key, response.status_code, response.text[:600])
+        return []
+    payload = response.json()
+    events = payload if isinstance(payload, list) else []
+    cache.set(cache_key, events, CACHE_TTL_SECONDS)
+    return events
+
+
 def get_upcoming_odds() -> list[dict[str, Any]]:
     cached = cache.get("odds:upcoming")
     if cached is not None:
         return cached
     if not settings.odds_api_key:
         return []
+
+    all_events: list[dict[str, Any]] = []
+
     params = {
         "apiKey": settings.odds_api_key,
-        "regions": "eu",
+        "regions": "eu,uk,us",
         "markets": "h2h,totals,btts,spreads",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
     }
-    response = retry_request("GET", ODDS_API_URL, params=params, timeout=20)
-    if response.status_code != 200:
-        log.error("Odds API status=%s body=%s", response.status_code, response.text[:1000])
-        return []
-    payload = response.json()
-    events = payload if isinstance(payload, list) else []
-    soccer_events = [event for event in events if str(event.get("sport_key", "")).startswith("soccer_")]
+    response = retry_request("GET", ODDS_UPCOMING_URL, params=params, timeout=20)
+    if response.status_code == 200:
+        payload = response.json()
+        events = payload if isinstance(payload, list) else []
+        all_events.extend([event for event in events if str(event.get("sport_key", "")).startswith("soccer_")])
+    else:
+        log.warning("Upcoming odds status=%s body=%s", response.status_code, response.text[:600])
+
+    if not all_events:
+        for sport_key in get_sport_keys()[:12]:
+            all_events.extend(fetch_events_for_sport(sport_key))
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for event in all_events:
+        event_id = str(event.get("id") or "")
+        deduped[event_id or f"{event.get('home_team','')}-{event.get('away_team','')}-{event.get('commence_time','')}"] = event
+
+    soccer_events = list(deduped.values())
     cache.set("odds:upcoming", soccer_events, CACHE_TTL_SECONDS)
     return soccer_events
 
@@ -511,7 +570,7 @@ def build_prediction_message(mode: str, insights: list[MatchInsight], page: int 
     ordered = sort_insights(insights, mode)
     if not ordered:
         return (
-            "No football matches found in the next 24 hours from The Odds API.",
+            "No football matches were returned by The Odds API right now. I checked the upcoming endpoint and soccer sport feeds and still got nothing.",
             main_menu_keyboard(),
         )
     total_pages = max(1, (len(ordered) + MAX_PAGE_SIZE - 1) // MAX_PAGE_SIZE)
