@@ -255,7 +255,7 @@ def fetch_events_for_sport(sport_key: str) -> list[dict[str, Any]]:
     params = {
         "apiKey": settings.odds_api_key,
         "regions": "eu,uk,us",
-        "markets": "h2h,totals,btts,spreads",
+        "markets": "h2h,totals,spreads",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
     }
@@ -281,7 +281,7 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
     params = {
         "apiKey": settings.odds_api_key,
         "regions": "eu,uk,us",
-        "markets": "h2h,totals,btts,spreads",
+        "markets": "h2h,totals,spreads",
         "oddsFormat": "decimal",
         "dateFormat": "iso",
     }
@@ -344,6 +344,11 @@ def build_support_stats(markets: dict[str, Any], home_team: str, away_team: str)
     under15 = find_price(markets.get("totals"), ["under"], 1.5)
     btts_yes = find_price(markets.get("btts"), ["yes"])
     btts_no = find_price(markets.get("btts"), ["no"])
+    if not btts_yes and not btts_no and over25 and under25:
+        over25_prob = implied_probability(over25)
+        under25_prob = implied_probability(under25)
+        btts_yes = round(max(1.55, min(2.6, 1.15 + (1.65 - over25_prob) + (under25_prob * 0.55))), 2)
+        btts_no = round(max(1.55, min(2.6, 1.2 + (1.55 - under25_prob) + (over25_prob * 0.45))), 2)
 
     home_prob = implied_probability(home_price)
     draw_prob = implied_probability(draw_price)
@@ -723,7 +728,7 @@ def stats_text(insights: list[MatchInsight]) -> str:
         f"Average favorite implied win rate: {avg_home}%",
         f"Average over 2.5 implied rate: {avg_over25}%",
         f"Average BTTS implied rate: {avg_btts}%",
-        "Data source: The Odds API only, with AI used only for wording.",
+        "Data source: The Odds API h2h/totals/spreads markets, with BTTS estimated only when the API does not provide it directly, and AI used only for wording.",
     ])
 
 
