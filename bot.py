@@ -44,12 +44,13 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_TIMEOUT = 20
 CACHE_TTL_SECONDS = 300
 AI_CACHE_TTL_SECONDS = 180
-COOLDOWN_SECONDS = 8
+COOLDOWN_SECONDS = 6
 SPAM_WINDOW_SECONDS = 20
-SPAM_MAX_REQUESTS = 6
-MATCH_WINDOW_HOURS = 24
-PAST_GRACE_HOURS = 3
+SPAM_MAX_REQUESTS = 8
+MATCH_WINDOW_HOURS = 48
+PAST_GRACE_HOURS = 6
 MAX_PAGE_SIZE = 3
+BOOKMAKER_SCAN_LIMIT = 8
 
 
 class TTLCache:
@@ -95,7 +96,7 @@ cache = TTLCache()
 ai_cache = TTLCache()
 rate_limiter = RateLimiter()
 session = requests.Session()
-session.headers.update({"User-Agent": "smart-football-bot/3.0"})
+session.headers.update({"User-Agent": "smart-football-bot/4.0"})
 
 
 @dataclass(slots=True)
@@ -175,16 +176,7 @@ def format_kickoff(value: str) -> str:
     return dt.strftime("%d %b %H:%M UTC") if dt else value
 
 
-def retry_request(
-    method: str,
-    url: str,
-    *,
-    params: dict[str, Any] | None = None,
-    headers: dict[str, str] | None = None,
-    json_body: dict[str, Any] | None = None,
-    timeout: int = DEFAULT_TIMEOUT,
-    attempts: int = 3,
-) -> requests.Response:
+def retry_request(method: str, url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None, json_body: dict[str, Any] | None = None, timeout: int = DEFAULT_TIMEOUT, attempts: int = 3) -> requests.Response:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -212,21 +204,11 @@ class TelegramClient:
         retry_request("POST", f"{TELEGRAM_API}/sendMessage", json_body=payload, timeout=15)
 
     def answer_callback(self, callback_id: str, text: str) -> None:
-        retry_request(
-            "POST",
-            f"{TELEGRAM_API}/answerCallbackQuery",
-            json_body={"callback_query_id": callback_id, "text": text[:180]},
-            timeout=10,
-        )
+        retry_request("POST", f"{TELEGRAM_API}/answerCallbackQuery", json_body={"callback_query_id": callback_id, "text": text[:180]}, timeout=10)
 
     def set_commands(self) -> None:
         try:
-            retry_request(
-                "POST",
-                f"{TELEGRAM_API}/setMyCommands",
-                json_body={"commands": COMMAND_DESCRIPTIONS},
-                timeout=15,
-            )
+            retry_request("POST", f"{TELEGRAM_API}/setMyCommands", json_body={"commands": COMMAND_DESCRIPTIONS}, timeout=15)
         except Exception as exc:
             log.warning("setMyCommands failed: %s", exc)
 
@@ -237,15 +219,13 @@ telegram = TelegramClient()
 def log_odds_debug(label: str, events: list[dict[str, Any]]) -> None:
     preview = []
     for event in events[:5]:
-        preview.append(
-            {
-                "sport_key": event.get("sport_key"),
-                "home_team": event.get("home_team"),
-                "away_team": event.get("away_team"),
-                "commence_time": event.get("commence_time"),
-                "bookmakers": len(event.get("bookmakers", []) or []),
-            }
-        )
+        preview.append({
+            "sport_key": event.get("sport_key"),
+            "home_team": event.get("home_team"),
+            "away_team": event.get("away_team"),
+            "commence_time": event.get("commence_time"),
+            "bookmakers": len(event.get("bookmakers", []) or []),
+        })
     log.info("%s count=%s preview=%s", label, len(events), json.dumps(preview)[:1500])
 
 
@@ -261,11 +241,7 @@ def get_sport_keys() -> list[str]:
         return []
     payload = response.json()
     sports = payload if isinstance(payload, list) else []
-    keys = [
-        str(item.get("key", ""))
-        for item in sports
-        if str(item.get("key", "")).startswith("soccer_") and not item.get("has_outrights", False)
-    ]
+    keys = [str(item.get("key", "")) for item in sports if str(item.get("key", "")).startswith("soccer_") and not item.get("has_outrights", False)]
     cache.set("odds:sport_keys", keys, CACHE_TTL_SECONDS)
     return keys
 
@@ -280,7 +256,7 @@ def fetch_events_for_sport(sport_key: str) -> list[dict[str, Any]]:
         f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
         params={
             "apiKey": settings.odds_api_key,
-            "regions": "eu,uk,us",
+            "regions": "eu,uk,us,au",
             "markets": "h2h,totals,spreads",
             "oddsFormat": "decimal",
             "dateFormat": "iso",
@@ -309,7 +285,7 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
         ODDS_UPCOMING_URL,
         params={
             "apiKey": settings.odds_api_key,
-            "regions": "eu,uk,us",
+            "regions": "eu,uk,us,au",
             "markets": "h2h,totals,spreads",
             "oddsFormat": "decimal",
             "dateFormat": "iso",
@@ -326,7 +302,7 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
         log.warning("Upcoming odds status=%s body=%s", response.status_code, response.text[:600])
 
     if not all_events:
-        sport_keys = get_sport_keys()[:12]
+        sport_keys = get_sport_keys()[:20]
         log.info("soccer sport keys=%s", sport_keys)
         for sport_key in sport_keys:
             sport_events = fetch_events_for_sport(sport_key)
@@ -343,13 +319,19 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
     return soccer_events
 
 
-def select_bookmaker(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    bookmakers = event.get("bookmakers", []) or []
-    if not bookmakers:
-        return "Unavailable", {}
-    bookmaker = bookmakers[0]
-    market_map = {market.get("key"): market for market in bookmaker.get("markets", [])}
-    return str(bookmaker.get("title", "Unavailable")), market_map
+def choose_best_bookmaker(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    bookmakers = (event.get("bookmakers", []) or [])[:BOOKMAKER_SCAN_LIMIT]
+    best_title = "Unavailable"
+    best_markets: dict[str, Any] = {}
+    best_score = -1
+    for bookmaker in bookmakers:
+        market_map = {market.get("key"): market for market in bookmaker.get("markets", [])}
+        score = int("h2h" in market_map) + int("totals" in market_map) + int("spreads" in market_map)
+        if score > best_score:
+            best_score = score
+            best_title = str(bookmaker.get("title", "Unavailable"))
+            best_markets = market_map
+    return best_title, best_markets
 
 
 def find_price(market: dict[str, Any] | None, names: Iterable[str], point: float | None = None) -> float | None:
@@ -430,7 +412,6 @@ def build_score_map(stats: dict[str, float]) -> dict[str, float]:
     under25 = stats["under25_prob"]
     over15 = stats["over15_prob"]
     btts_yes = stats["btts_yes_prob"]
-    btts_no = stats["btts_no_prob"]
     corners_proxy = min(0.82, (over25 * 0.55) + ((home + away) * 0.25) + 0.08)
     cards_proxy = min(0.80, (draw * 0.45) + ((home + away) * 0.25) + 0.10)
     first_half = min(0.84, (over15 * 0.70) + (over25 * 0.15) + 0.05)
@@ -444,18 +425,13 @@ def build_score_map(stats: dict[str, float]) -> dict[str, float]:
         "under25": under25,
         "over15": over15,
         "btts_yes": btts_yes,
-        "btts_no": btts_no,
+        "btts_no": stats["btts_no_prob"],
         "corners": corners_proxy,
         "cards": cards_proxy,
         "first_half": first_half,
         "second_half": second_half,
         "safe": max(home, away, over15),
-        "value": max(
-            stats["home_price"] * home,
-            stats["away_price"] * away,
-            stats["over25"] * over25,
-            stats["btts_yes"] * btts_yes,
-        ),
+        "value": max(stats["home_price"] * home, stats["away_price"] * away, stats["over25"] * over25, stats["btts_yes"] * btts_yes),
     }
 
 
@@ -471,33 +447,31 @@ def upcoming_match_insights() -> list[MatchInsight]:
         kickoff = parse_iso_time(str(event.get("commence_time", "")))
         if not kickoff or kickoff < past_cutoff or kickoff > cutoff:
             continue
-        bookmaker, markets = select_bookmaker(event)
+        bookmaker, markets = choose_best_bookmaker(event)
         if "h2h" not in markets:
             continue
         home_team = str(event.get("home_team", "Unknown"))
         away_team = str(event.get("away_team", "Unknown"))
         support = build_support_stats(markets, home_team, away_team)
-        insights.append(
-            MatchInsight(
-                match_id=str(event.get("id") or f"{home_team}-{away_team}-{event.get('commence_time', '')}"),
-                competition=str(event.get("sport_title", "Football")),
-                kickoff_utc=str(event.get("commence_time", "")),
-                home_team=home_team,
-                away_team=away_team,
-                bookmaker=bookmaker,
-                odds_home=support["home_price"] or None,
-                odds_draw=support["draw_price"] or None,
-                odds_away=support["away_price"] or None,
-                totals_over_25=support["over25"] or None,
-                totals_under_25=support["under25"] or None,
-                btts_yes=support["btts_yes"] or None,
-                btts_no=support["btts_no"] or None,
-                totals_over_15=support["over15"] or None,
-                totals_under_15=support["under15"] or None,
-                score_map=build_score_map(support),
-                support_stats=support,
-            )
-        )
+        insights.append(MatchInsight(
+            match_id=str(event.get("id") or f"{home_team}-{away_team}-{event.get('commence_time', '')}"),
+            competition=str(event.get("sport_title", "Football")),
+            kickoff_utc=str(event.get("commence_time", "")),
+            home_team=home_team,
+            away_team=away_team,
+            bookmaker=bookmaker,
+            odds_home=support["home_price"] or None,
+            odds_draw=support["draw_price"] or None,
+            odds_away=support["away_price"] or None,
+            totals_over_25=support["over25"] or None,
+            totals_under_25=support["under25"] or None,
+            btts_yes=support["btts_yes"] or None,
+            btts_no=support["btts_no"] or None,
+            totals_over_15=support["over15"] or None,
+            totals_under_15=support["under15"] or None,
+            score_map=build_score_map(support),
+            support_stats=support,
+        ))
 
     insights.sort(key=lambda item: item.kickoff_utc)
     log.info("match insights count=%s", len(insights))
@@ -548,17 +522,7 @@ def pick_for_mode(insight: MatchInsight, mode: str) -> dict[str, Any]:
             value_rating = "B+"
             key = max(s["safe"], s["over25"])
             conf = confidence(key)
-        return {
-            "market": market,
-            "bet": bet,
-            "confidence": conf,
-            "risk": risk,
-            "value": value_rating,
-            "odds": odds,
-            "key": key,
-            "stake": max(1, min(10, round((conf - 40) / 6))),
-            "support": support_summary(insight),
-        }
+        return {"market": market, "bet": bet, "confidence": conf, "risk": risk, "value": value_rating, "odds": odds, "key": key, "stake": max(1, min(10, round((conf - 40) / 6))), "support": support_summary(insight)}
 
     mapping = {
         "live": ("Watchlist", "Wait for in-play entry on the stronger side", confidence(max(s["value"] / 2.5, 0.48), 45, 74), "Medium", "B", insight.odds_home if s["home_win"] >= s["away_win"] else insight.odds_away, s["value"]),
@@ -575,17 +539,7 @@ def pick_for_mode(insight: MatchInsight, mode: str) -> dict[str, Any]:
         "secondhalf": ("Second Half", "Over 0.5 Second Half Goals", confidence(s["second_half"], 47, 78), "Medium", "B", insight.totals_over_15, s["second_half"]),
     }
     market, bet, conf, risk, value_rating, odds, key = mapping.get(mode, mapping["safe"])
-    return {
-        "market": market,
-        "bet": bet,
-        "confidence": conf,
-        "risk": risk,
-        "value": value_rating,
-        "odds": odds,
-        "key": key,
-        "stake": max(1, min(10, round((conf - 40) / 6))),
-        "support": support_summary(insight),
-    }
+    return {"market": market, "bet": bet, "confidence": conf, "risk": risk, "value": value_rating, "odds": odds, "key": key, "stake": max(1, min(10, round((conf - 40) / 6))), "support": support_summary(insight)}
 
 
 def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) -> dict[str, str]:
@@ -593,37 +547,14 @@ def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) ->
     cached = ai_cache.get(cache_key)
     if cached is not None:
         return cached
-
     prompt_items = []
     for insight, pick in picks:
-        prompt_items.append(
-            {
-                "match_id": insight.match_id,
-                "match": f"{insight.home_team} vs {insight.away_team}",
-                "market": pick["market"],
-                "recommended_bet": pick["bet"],
-                "odds": pick["odds"],
-                "support": insight.support_stats,
-            }
-        )
-
-    instruction = (
-        "Use only the supplied market data. Do not invent xG, injuries, possession, form, head-to-head, or live stats. "
-        "Return pure JSON mapping match_id to one short reason sentence."
-    )
+        prompt_items.append({"match_id": insight.match_id, "match": f"{insight.home_team} vs {insight.away_team}", "market": pick["market"], "recommended_bet": pick["bet"], "odds": pick["odds"], "support": insight.support_stats})
+    instruction = "Use only the supplied market data. Do not invent xG, injuries, possession, form, head-to-head, or live stats. Return pure JSON mapping match_id to one short reason sentence."
 
     if settings.gemini_api_key:
         try:
-            response = retry_request(
-                "POST",
-                GEMINI_URL,
-                headers={"Content-Type": "application/json", "x-goog-api-key": settings.gemini_api_key},
-                json_body={
-                    "contents": [{"parts": [{"text": instruction + "\n\n" + json.dumps(prompt_items, ensure_ascii=False)}]}],
-                    "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-                },
-                timeout=25,
-            )
+            response = retry_request("POST", GEMINI_URL, headers={"Content-Type": "application/json", "x-goog-api-key": settings.gemini_api_key}, json_body={"contents": [{"parts": [{"text": instruction + "\n\n" + json.dumps(prompt_items, ensure_ascii=False)}]}], "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}, timeout=25)
             if response.status_code == 200:
                 data = response.json()
                 text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "{}")
@@ -636,26 +567,7 @@ def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) ->
 
     if settings.openrouter_api_key:
         try:
-            response = retry_request(
-                "POST",
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {settings.openrouter_api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://render.com",
-                    "X-Title": "smart-football-bot",
-                },
-                json_body={
-                    "model": "openrouter/auto",
-                    "messages": [
-                        {"role": "system", "content": instruction},
-                        {"role": "user", "content": json.dumps(prompt_items, ensure_ascii=False)},
-                    ],
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=25,
-            )
+            response = retry_request("POST", OPENROUTER_URL, headers={"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json", "HTTP-Referer": "https://render.com", "X-Title": "smart-football-bot"}, json_body={"model": "openrouter/auto", "messages": [{"role": "system", "content": instruction}, {"role": "user", "content": json.dumps(prompt_items, ensure_ascii=False)}], "temperature": 0.2, "response_format": {"type": "json_object"}}, timeout=25)
             if response.status_code == 200:
                 data = response.json()
                 text = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
@@ -672,21 +584,7 @@ def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) ->
 
 
 def sort_insights(insights: list[MatchInsight], mode: str) -> list[MatchInsight]:
-    key_map = {
-        "today": "safe",
-        "live": "value",
-        "safe": "safe",
-        "value": "value",
-        "acca": "over15",
-        "corners": "corners",
-        "cards": "cards",
-        "goals": "over25",
-        "btts": "btts_yes",
-        "over25": "over25",
-        "under25": "under25",
-        "firsthalf": "first_half",
-        "secondhalf": "second_half",
-    }
+    key_map = {"today": "safe", "live": "value", "safe": "safe", "value": "value", "acca": "over15", "corners": "corners", "cards": "cards", "goals": "over25", "btts": "btts_yes", "over25": "over25", "under25": "under25", "firsthalf": "first_half", "secondhalf": "second_half"}
     key = key_map.get(mode, "safe")
     return sorted(insights, key=lambda item: item.score_map.get(key, 0.0), reverse=True)
 
@@ -694,75 +592,36 @@ def sort_insights(insights: list[MatchInsight], mode: str) -> list[MatchInsight]
 def build_prediction_message(mode: str, insights: list[MatchInsight], page: int = 0) -> tuple[str, dict[str, Any]]:
     ordered = sort_insights(insights, mode)
     if not ordered:
-        return (
-            f"No football matches were available between the last {PAST_GRACE_HOURS} hours and the next {MATCH_WINDOW_HOURS} hours from The Odds API.",
-            main_menu_keyboard(),
-        )
-
+        return (f"No football matches were available between the last {PAST_GRACE_HOURS} hours and the next {MATCH_WINDOW_HOURS} hours from The Odds API.", main_menu_keyboard())
     total_pages = max(1, (len(ordered) + MAX_PAGE_SIZE - 1) // MAX_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
-    selected = ordered[page * MAX_PAGE_SIZE : (page + 1) * MAX_PAGE_SIZE]
+    selected = ordered[page * MAX_PAGE_SIZE:(page + 1) * MAX_PAGE_SIZE]
     picks = [(insight, pick_for_mode(insight, mode)) for insight in selected]
     ai_notes = ai_reasoning(mode, picks)
-
-    title_map = {
-        "today": "Today board",
-        "live": "Live watchlist",
-        "safe": "Safe board",
-        "value": "Value board",
-        "acca": "Acca board",
-        "corners": "Corners board",
-        "cards": "Cards board",
-        "goals": "Goals board",
-        "btts": "BTTS board",
-        "over25": "Over 2.5 board",
-        "under25": "Under 2.5 board",
-        "firsthalf": "First half board",
-        "secondhalf": "Second half board",
-    }
-
+    title_map = {"today": "Today board", "live": "Live watchlist", "safe": "Safe board", "value": "Value board", "acca": "Acca board", "corners": "Corners board", "cards": "Cards board", "goals": "Goals board", "btts": "BTTS board", "over25": "Over 2.5 board", "under25": "Under 2.5 board", "firsthalf": "First half board", "secondhalf": "Second half board"}
     lines = [f"{title_map.get(mode, 'Betting board')} ({page + 1}/{total_pages})"]
     for insight, pick in picks:
-        odds_text = f"{pick['odds']:.2f}" if isinstance(pick["odds"], (int, float)) and pick["odds"] > 0 else "N/A"
-        lines.extend(
-            [
-                "",
-                f"âš½ {insight.home_team} vs {insight.away_team}",
-                f"ðŸ† {insight.competition}",
-                f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
-                f"ðŸŽ¯ Market: {pick['market']}",
-                f"âœ… Bet: {pick['bet']}",
-                f"ðŸ”¥ Confidence: {pick['confidence']}%",
-                f"ðŸ“Š Stats: {pick['support']}",
-                f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
-                f"âš ï¸ Risk: {pick['risk']}",
-                f"â­ Value: {pick['value']}",
-                f"ðŸŽšï¸ Stake: {pick['stake']}/10",
-                f"ðŸ§  Why: {ai_notes.get(insight.match_id, 'This angle follows the current bookmaker pricing and market balance only.')}",
-            ]
-        )
-    return "\n".join(lines), prediction_keyboard(mode, page, total_pages)
+        odds_text = f"{pick['odds']:.2f}" if isinstance(pick['odds'], (int, float)) and pick['odds'] > 0 else "N/A"
+        lines.extend([
+            "",
+            f"âš½ {insight.home_team} vs {insight.away_team}",
+            f"ðŸ† {insight.competition}",
+            f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
+            f"ðŸŽ¯ Market: {pick['market']}",
+            f"âœ… Bet: {pick['bet']}",
+            f"ðŸ”¥ Confidence: {pick['confidence']}%",
+            f"ðŸ“Š Stats: {pick['support']}",
+            f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
+            f"âš ï¸ Risk: {pick['risk']}",
+            f"â­ Value: {pick['value']}",
+            f"ðŸŽšï¸ Stake: {pick['stake']}/10",
+            f"ðŸ§  Why: {ai_notes.get(insight.match_id, 'This angle follows the current bookmaker pricing and market balance only.')}",
+        ])
+    return ("\n".join(lines), prediction_keyboard(mode, page, total_pages))
 
 
 def main_menu_keyboard() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "Today", "callback_data": "menu:today:0"},
-                {"text": "Safe", "callback_data": "menu:safe:0"},
-                {"text": "Value", "callback_data": "menu:value:0"},
-            ],
-            [
-                {"text": "Goals", "callback_data": "menu:goals:0"},
-                {"text": "Corners", "callback_data": "menu:corners:0"},
-                {"text": "Cards", "callback_data": "menu:cards:0"},
-            ],
-            [
-                {"text": "Acca", "callback_data": "menu:acca:0"},
-                {"text": "Stats", "callback_data": "menu:stats:0"},
-            ],
-        ]
-    }
+    return {"inline_keyboard": [[{"text": "Today", "callback_data": "menu:today:0"}, {"text": "Safe", "callback_data": "menu:safe:0"}, {"text": "Value", "callback_data": "menu:value:0"}], [{"text": "Goals", "callback_data": "menu:goals:0"}, {"text": "Corners", "callback_data": "menu:corners:0"}, {"text": "Cards", "callback_data": "menu:cards:0"}], [{"text": "Acca", "callback_data": "menu:acca:0"}, {"text": "Stats", "callback_data": "menu:stats:0"}]]}
 
 
 def prediction_keyboard(mode: str, page: int, total_pages: int) -> dict[str, Any]:
@@ -774,10 +633,7 @@ def prediction_keyboard(mode: str, page: int, total_pages: int) -> dict[str, Any
         nav.append({"text": "Next", "callback_data": f"menu:{mode}:{page + 1}"})
     if nav:
         rows.append(nav)
-    rows.append([
-        {"text": "Menu", "callback_data": "menu:menu:0"},
-        {"text": "Stats", "callback_data": "menu:stats:0"},
-    ])
+    rows.append([{"text": "Menu", "callback_data": "menu:menu:0"}, {"text": "Stats", "callback_data": "menu:stats:0"}])
     return {"inline_keyboard": rows}
 
 
@@ -792,11 +648,11 @@ def help_text() -> str:
 
 def parse_command(text: str) -> tuple[str, str]:
     if not text.startswith("/"):
-        return "help", text
+        return ("help", text)
     body = text[1:]
     command_part, _, args = body.partition(" ")
     command = command_part.split("@", 1)[0].strip().lower()
-    return ALIAS_MAP.get(command, command), args.strip()
+    return (ALIAS_MAP.get(command, command), args.strip())
 
 
 def filter_by_team(insights: list[MatchInsight], query: str) -> list[MatchInsight]:
@@ -820,23 +676,21 @@ def find_match(insights: list[MatchInsight], left: str, right: str) -> MatchInsi
 def single_match_text(insight: MatchInsight, mode: str) -> str:
     pick = pick_for_mode(insight, mode)
     reason = ai_reasoning(mode, [(insight, pick)]).get(insight.match_id, "This angle follows the current bookmaker pricing and market balance only.")
-    odds_text = f"{pick['odds']:.2f}" if isinstance(pick["odds"], (int, float)) and pick["odds"] > 0 else "N/A"
-    return "\n".join(
-        [
-            f"âš½ {insight.home_team} vs {insight.away_team}",
-            f"ðŸ† {insight.competition}",
-            f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
-            f"ðŸŽ¯ Market: {pick['market']}",
-            f"âœ… Bet: {pick['bet']}",
-            f"ðŸ”¥ Confidence: {pick['confidence']}%",
-            f"ðŸ“Š Stats: {pick['support']}",
-            f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
-            f"âš ï¸ Risk: {pick['risk']}",
-            f"â­ Value: {pick['value']}",
-            f"ðŸŽšï¸ Stake: {pick['stake']}/10",
-            f"ðŸ§  Why: {reason}",
-        ]
-    )
+    odds_text = f"{pick['odds']:.2f}" if isinstance(pick['odds'], (int, float)) and pick['odds'] > 0 else "N/A"
+    return "\n".join([
+        f"âš½ {insight.home_team} vs {insight.away_team}",
+        f"ðŸ† {insight.competition}",
+        f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
+        f"ðŸŽ¯ Market: {pick['market']}",
+        f"âœ… Bet: {pick['bet']}",
+        f"ðŸ”¥ Confidence: {pick['confidence']}%",
+        f"ðŸ“Š Stats: {pick['support']}",
+        f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
+        f"âš ï¸ Risk: {pick['risk']}",
+        f"â­ Value: {pick['value']}",
+        f"ðŸŽšï¸ Stake: {pick['stake']}/10",
+        f"ðŸ§  Why: {reason}",
+    ])
 
 
 def stats_text(insights: list[MatchInsight]) -> str:
@@ -847,47 +701,42 @@ def stats_text(insights: list[MatchInsight]) -> str:
     btts_values = [item.support_stats["btts_yes_prob"] for item in insights if item.support_stats["btts_yes_prob"] > 0]
     avg_over25 = round(sum(over25_values) / len(over25_values) * 100) if over25_values else 0
     avg_btts = round(sum(btts_values) / len(btts_values) * 100) if btts_values else 0
-    return "\n".join(
-        [
-            "Loaded market stats",
-            f"Matches in last {PAST_GRACE_HOURS}h to next {MATCH_WINDOW_HOURS}h: {len(insights)}",
-            f"Average favorite implied win rate: {avg_home}%",
-            f"Average over 2.5 implied rate: {avg_over25}%",
-            f"Average BTTS estimated rate: {avg_btts}%",
-            "Data source: The Odds API h2h, totals, and spreads only, with BTTS estimated from totals when needed.",
-        ]
-    )
+    return "\n".join([
+        "Loaded market stats",
+        f"Matches in last {PAST_GRACE_HOURS}h to next {MATCH_WINDOW_HOURS}h: {len(insights)}",
+        f"Average favorite implied win rate: {avg_home}%",
+        f"Average over 2.5 implied rate: {avg_over25}%",
+        f"Average BTTS estimated rate: {avg_btts}%",
+        "Data source: The Odds API h2h, totals, and spreads only, with BTTS estimated from totals when needed.",
+    ])
 
 
 def handle_text_command(command: str, args: str, insights: list[MatchInsight]) -> tuple[str, dict[str, Any] | None]:
     if command == "start":
-        return (
-            "Welcome to Football Intelligence Pro\n\nPremium betting assistant using Telegram, Odds API, Gemini, OpenRouter, and webhook only.",
-            main_menu_keyboard(),
-        )
+        return ("Welcome to Football Intelligence Pro\n\nPremium betting assistant using Telegram, Odds API, Gemini, OpenRouter, and webhook only.", main_menu_keyboard())
     if command in {"help", "menu"}:
-        return help_text(), main_menu_keyboard()
+        return (help_text(), main_menu_keyboard())
     if command in {"today", "live", "safe", "value", "acca", "corners", "cards", "goals", "btts", "over25", "under25", "firsthalf", "secondhalf"}:
         return build_prediction_message(command, insights, 0)
     if command == "stats":
-        return stats_text(insights), {"inline_keyboard": [[{"text": "Menu", "callback_data": "menu:menu:0"}]]}
+        return (stats_text(insights), {"inline_keyboard": [[{"text": "Menu", "callback_data": "menu:menu:0"}]]})
     if command == "team":
         if not args:
-            return "Usage: /team arsenal", None
+            return ("Usage: /team arsenal", None)
         matches = filter_by_team(insights, args)
         if not matches:
-            return f"No upcoming fixtures found for {args}.", None
+            return (f"No upcoming fixtures found for {args}.", None)
         lines = [f"Fixtures for {args}:"]
         for item in matches[:8]:
             lines.append(f"- {item.home_team} vs {item.away_team} | {format_kickoff(item.kickoff_utc)}")
-        return "\n".join(lines), None
+        return ("\n".join(lines), None)
     if command in {"match", "analyze"}:
         if args and " vs " in args.lower():
             left, right = re.split(r"\s+vs\s+", args, maxsplit=1, flags=re.IGNORECASE)
             insight = find_match(insights, left, right)
             if not insight:
-                return "Match not found in the current window.", None
-            return single_match_text(insight, "value" if command == "analyze" else "today"), None
+                return ("Match not found in the current window.", None)
+            return (single_match_text(insight, "value" if command == "analyze" else "today"), None)
         if args:
             filtered = filter_by_team(insights, args)
             if filtered:
@@ -895,22 +744,22 @@ def handle_text_command(command: str, args: str, insights: list[MatchInsight]) -
         return build_prediction_message("value" if command == "analyze" else "today", insights, 0)
     if command == "search":
         if not args:
-            return "Usage: /search arsenal", None
+            return ("Usage: /search arsenal", None)
         filtered = filter_by_team(insights, args)
         if not filtered:
-            return f"No upcoming fixtures found for {args}.", None
+            return (f"No upcoming fixtures found for {args}.", None)
         return build_prediction_message("today", filtered, 0)
-    return "Unknown command. Use /help.", main_menu_keyboard()
+    return ("Unknown command. Use /help.", main_menu_keyboard())
 
 
 @app.get("/")
 def home() -> tuple[str, int]:
-    return "Bot is alive.", 200
+    return ("Bot is alive.", 200)
 
 
 @app.get("/healthz")
 def healthz() -> tuple[Any, int]:
-    return jsonify({"ok": True, "time": datetime.now(UTC).isoformat()}), 200
+    return (jsonify({"ok": True, "time": datetime.now(UTC).isoformat()}), 200)
 
 
 @app.post(f"/webhook/{settings.webhook_secret}")
@@ -937,12 +786,12 @@ def webhook() -> tuple[Any, int]:
                 else:
                     text, keyboard = build_prediction_message(mode, insights, page)
                     telegram.send_message(chat_id, text, keyboard)
-            return jsonify({"ok": True}), 200
+            return (jsonify({"ok": True}), 200)
 
         message = update.get("message") or update.get("edited_message") or {}
         chat_id = int(message.get("chat", {}).get("id", 0) or 0)
         if not chat_id:
-            return jsonify({"ok": True}), 200
+            return (jsonify({"ok": True}), 200)
 
         user_id = str(message.get("from", {}).get("id", "0"))
         text = str(message.get("text") or "").strip()
@@ -950,21 +799,21 @@ def webhook() -> tuple[Any, int]:
 
         if rate_limiter.is_spamming(user_id):
             telegram.send_message(chat_id, "Slow down. Too many requests in a short time.")
-            return jsonify({"ok": True}), 200
+            return (jsonify({"ok": True}), 200)
 
         if command not in {"start", "help", "menu"}:
             remaining = rate_limiter.cooldown_remaining(f"{user_id}:{command}")
             if remaining > 0:
                 telegram.send_message(chat_id, f"Cooldown active. Please wait {remaining}s before /{command} again.")
-                return jsonify({"ok": True}), 200
+                return (jsonify({"ok": True}), 200)
 
         insights = upcoming_match_insights()
         text_out, keyboard = handle_text_command(command, args, insights)
         telegram.send_message(chat_id, text_out, keyboard)
-        return jsonify({"ok": True}), 200
+        return (jsonify({"ok": True}), 200)
     except Exception as exc:
         log.exception("Webhook error: %s", exc)
-        return jsonify({"ok": False, "error": "internal_error"}), 500
+        return (jsonify({"ok": False, "error": "internal_error"}), 500)
 
 
 telegram.set_commands()
