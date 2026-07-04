@@ -50,7 +50,6 @@ SPAM_MAX_REQUESTS = 6
 MATCH_WINDOW_HOURS = 24
 PAST_GRACE_HOURS = 3
 MAX_PAGE_SIZE = 3
-ODDS_SPORT_FILTER = {"soccer"}
 
 
 class TTLCache:
@@ -96,7 +95,7 @@ cache = TTLCache()
 ai_cache = TTLCache()
 rate_limiter = RateLimiter()
 session = requests.Session()
-session.headers.update({"User-Agent": "smart-football-bot/2.1"})
+session.headers.update({"User-Agent": "smart-football-bot/3.0"})
 
 
 @dataclass(slots=True)
@@ -124,7 +123,7 @@ COMMAND_DESCRIPTIONS: list[dict[str, str]] = [
     {"command": "start", "description": "Open the welcome screen"},
     {"command": "help", "description": "Show all commands"},
     {"command": "menu", "description": "Open the main menu"},
-    {"command": "today", "description": "Best football matches today"},
+    {"command": "today", "description": "Best football matches"},
     {"command": "live", "description": "Upcoming watchlist"},
     {"command": "now", "description": "Alias of live"},
     {"command": "safe", "description": "Safer picks"},
@@ -134,7 +133,7 @@ COMMAND_DESCRIPTIONS: list[dict[str, str]] = [
     {"command": "acca", "description": "Accumulator picks"},
     {"command": "corners", "description": "Corners angles"},
     {"command": "cards", "description": "Cards angles"},
-    {"command": "goals", "description": "Goals-focused picks"},
+    {"command": "goals", "description": "Goals picks"},
     {"command": "btts", "description": "BTTS picks"},
     {"command": "over25", "description": "Over 2.5 picks"},
     {"command": "under25", "description": "Under 2.5 picks"},
@@ -147,7 +146,7 @@ COMMAND_DESCRIPTIONS: list[dict[str, str]] = [
     {"command": "matches", "description": "Alias of today"},
     {"command": "stats", "description": "Show loaded market stats"},
     {"command": "analyze", "description": "Analyze a match or board"},
-    {"command": "team", "description": "Search a team in upcoming fixtures"},
+    {"command": "team", "description": "Search a team in fixtures"},
     {"command": "match", "description": "Analyze TEAM1 vs TEAM2"},
     {"command": "search", "description": "Search fixtures by text"},
 ]
@@ -176,7 +175,16 @@ def format_kickoff(value: str) -> str:
     return dt.strftime("%d %b %H:%M UTC") if dt else value
 
 
-def retry_request(method: str, url: str, *, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None, json_body: dict[str, Any] | None = None, timeout: int = DEFAULT_TIMEOUT, attempts: int = 3) -> requests.Response:
+def retry_request(
+    method: str,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    json_body: dict[str, Any] | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    attempts: int = 3,
+) -> requests.Response:
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -226,24 +234,38 @@ class TelegramClient:
 telegram = TelegramClient()
 
 
+def log_odds_debug(label: str, events: list[dict[str, Any]]) -> None:
+    preview = []
+    for event in events[:5]:
+        preview.append(
+            {
+                "sport_key": event.get("sport_key"),
+                "home_team": event.get("home_team"),
+                "away_team": event.get("away_team"),
+                "commence_time": event.get("commence_time"),
+                "bookmakers": len(event.get("bookmakers", []) or []),
+            }
+        )
+    log.info("%s count=%s preview=%s", label, len(events), json.dumps(preview)[:1500])
+
+
 def get_sport_keys() -> list[str]:
     cached = cache.get("odds:sport_keys")
     if cached is not None:
         return cached
     if not settings.odds_api_key:
         return []
-    response = retry_request(
-        "GET",
-        ODDS_SPORTS_URL,
-        params={"apiKey": settings.odds_api_key},
-        timeout=20,
-    )
+    response = retry_request("GET", ODDS_SPORTS_URL, params={"apiKey": settings.odds_api_key}, timeout=20)
     if response.status_code != 200:
         log.error("Odds sports status=%s body=%s", response.status_code, response.text[:1000])
         return []
     payload = response.json()
     sports = payload if isinstance(payload, list) else []
-    keys = [str(item.get("key", "")) for item in sports if str(item.get("key", "")).startswith("soccer_") and not item.get("has_outrights", False)]
+    keys = [
+        str(item.get("key", ""))
+        for item in sports
+        if str(item.get("key", "")).startswith("soccer_") and not item.get("has_outrights", False)
+    ]
     cache.set("odds:sport_keys", keys, CACHE_TTL_SECONDS)
     return keys
 
@@ -253,14 +275,18 @@ def fetch_events_for_sport(sport_key: str) -> list[dict[str, Any]]:
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
-    params = {
-        "apiKey": settings.odds_api_key,
-        "regions": "eu,uk,us",
-        "markets": "h2h,totals,spreads",
-        "oddsFormat": "decimal",
-        "dateFormat": "iso",
-    }
-    response = retry_request("GET", f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds", params=params, timeout=20)
+    response = retry_request(
+        "GET",
+        f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
+        params={
+            "apiKey": settings.odds_api_key,
+            "regions": "eu,uk,us",
+            "markets": "h2h,totals,spreads",
+            "oddsFormat": "decimal",
+            "dateFormat": "iso",
+        },
+        timeout=20,
+    )
     if response.status_code != 200:
         log.warning("Odds fetch failed for %s status=%s body=%s", sport_key, response.status_code, response.text[:600])
         return []
@@ -278,15 +304,18 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
         return []
 
     all_events: list[dict[str, Any]] = []
-
-    params = {
-        "apiKey": settings.odds_api_key,
-        "regions": "eu,uk,us",
-        "markets": "h2h,totals,spreads",
-        "oddsFormat": "decimal",
-        "dateFormat": "iso",
-    }
-    response = retry_request("GET", ODDS_UPCOMING_URL, params=params, timeout=20)
+    response = retry_request(
+        "GET",
+        ODDS_UPCOMING_URL,
+        params={
+            "apiKey": settings.odds_api_key,
+            "regions": "eu,uk,us",
+            "markets": "h2h,totals,spreads",
+            "oddsFormat": "decimal",
+            "dateFormat": "iso",
+        },
+        timeout=20,
+    )
     if response.status_code == 200:
         payload = response.json()
         events = payload if isinstance(payload, list) else []
@@ -306,34 +335,21 @@ def get_upcoming_odds() -> list[dict[str, Any]]:
 
     deduped: dict[str, dict[str, Any]] = {}
     for event in all_events:
-        event_id = str(event.get("id") or "")
-        deduped[event_id or f"{event.get('home_team','')}-{event.get('away_team','')}-{event.get('commence_time','')}"] = event
+        event_id = str(event.get("id") or f"{event.get('home_team', '')}-{event.get('away_team', '')}-{event.get('commence_time', '')}")
+        deduped[event_id] = event
 
     soccer_events = list(deduped.values())
     cache.set("odds:upcoming", soccer_events, CACHE_TTL_SECONDS)
     return soccer_events
 
 
-
-
-def log_odds_debug(label: str, events: list[dict[str, Any]]) -> None:
-    preview = []
-    for event in events[:5]:
-        preview.append({
-            "sport_key": event.get("sport_key"),
-            "home_team": event.get("home_team"),
-            "away_team": event.get("away_team"),
-            "commence_time": event.get("commence_time"),
-            "bookmakers": len(event.get("bookmakers", []) or []),
-        })
-    log.info("%s count=%s preview=%s", label, len(events), json.dumps(preview)[:1500])
-
 def select_bookmaker(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     bookmakers = event.get("bookmakers", []) or []
     if not bookmakers:
         return "Unavailable", {}
     bookmaker = bookmakers[0]
-    return str(bookmaker.get("title", "Unavailable")), {market.get("key"): market for market in bookmaker.get("markets", [])}
+    market_map = {market.get("key"): market for market in bookmaker.get("markets", [])}
+    return str(bookmaker.get("title", "Unavailable")), market_map
 
 
 def find_price(market: dict[str, Any] | None, names: Iterable[str], point: float | None = None) -> float | None:
@@ -355,6 +371,16 @@ def implied_probability(price: float | None) -> float:
     return 1.0 / price
 
 
+def estimate_btts_from_totals(over25: float | None, under25: float | None) -> tuple[float | None, float | None]:
+    if not over25 or not under25:
+        return None, None
+    over25_prob = implied_probability(over25)
+    under25_prob = implied_probability(under25)
+    btts_yes = round(max(1.55, min(2.60, 1.15 + (1.65 - over25_prob) + (under25_prob * 0.55))), 2)
+    btts_no = round(max(1.55, min(2.60, 1.20 + (1.55 - under25_prob) + (over25_prob * 0.45))), 2)
+    return btts_yes, btts_no
+
+
 def build_support_stats(markets: dict[str, Any], home_team: str, away_team: str) -> dict[str, float]:
     home_price = find_price(markets.get("h2h"), [home_team])
     draw_price = find_price(markets.get("h2h"), ["draw"])
@@ -363,13 +389,7 @@ def build_support_stats(markets: dict[str, Any], home_team: str, away_team: str)
     under25 = find_price(markets.get("totals"), ["under"], 2.5)
     over15 = find_price(markets.get("totals"), ["over"], 1.5)
     under15 = find_price(markets.get("totals"), ["under"], 1.5)
-    btts_yes = find_price(markets.get("btts"), ["yes"])
-    btts_no = find_price(markets.get("btts"), ["no"])
-    if not btts_yes and not btts_no and over25 and under25:
-        over25_prob = implied_probability(over25)
-        under25_prob = implied_probability(under25)
-        btts_yes = round(max(1.55, min(2.6, 1.15 + (1.65 - over25_prob) + (under25_prob * 0.55))), 2)
-        btts_no = round(max(1.55, min(2.6, 1.2 + (1.55 - under25_prob) + (over25_prob * 0.45))), 2)
+    btts_yes, btts_no = estimate_btts_from_totals(over25, under25)
 
     home_prob = implied_probability(home_price)
     draw_prob = implied_probability(draw_price)
@@ -413,7 +433,7 @@ def build_score_map(stats: dict[str, float]) -> dict[str, float]:
     btts_no = stats["btts_no_prob"]
     corners_proxy = min(0.82, (over25 * 0.55) + ((home + away) * 0.25) + 0.08)
     cards_proxy = min(0.80, (draw * 0.45) + ((home + away) * 0.25) + 0.10)
-    first_half = min(0.84, (over15 * 0.7) + (over25 * 0.15) + 0.05)
+    first_half = min(0.84, (over15 * 0.70) + (over25 * 0.15) + 0.05)
     second_half = min(0.86, (over25 * 0.40) + (btts_yes * 0.20) + 0.18)
     return {
         "home_win": home,
@@ -430,7 +450,12 @@ def build_score_map(stats: dict[str, float]) -> dict[str, float]:
         "first_half": first_half,
         "second_half": second_half,
         "safe": max(home, away, over15),
-        "value": max(stats["home_price"] * home, stats["away_price"] * away, stats["over25"] * over25, stats["btts_yes"] * btts_yes),
+        "value": max(
+            stats["home_price"] * home,
+            stats["away_price"] * away,
+            stats["over25"] * over25,
+            stats["btts_yes"] * btts_yes,
+        ),
     }
 
 
@@ -438,9 +463,10 @@ def upcoming_match_insights() -> list[MatchInsight]:
     now = datetime.now(UTC)
     cutoff = now + timedelta(hours=MATCH_WINDOW_HOURS)
     past_cutoff = now - timedelta(hours=PAST_GRACE_HOURS)
-    insights: list[MatchInsight] = []
     raw_events = get_upcoming_odds()
     log_odds_debug("raw_soccer_events_before_time_filter", raw_events)
+    insights: list[MatchInsight] = []
+
     for event in raw_events:
         kickoff = parse_iso_time(str(event.get("commence_time", "")))
         if not kickoff or kickoff < past_cutoff or kickoff > cutoff:
@@ -472,6 +498,7 @@ def upcoming_match_insights() -> list[MatchInsight]:
                 support_stats=support,
             )
         )
+
     insights.sort(key=lambda item: item.kickoff_utc)
     log.info("match insights count=%s", len(insights))
     return insights
@@ -484,20 +511,56 @@ def confidence(prob: float, low: int = 48, high: int = 85) -> int:
 
 def support_summary(insight: MatchInsight) -> str:
     s = insight.support_stats
-    chunks = [f"1X2 {round(s['home_prob']*100)}-{round(s['draw_prob']*100)}-{round(s['away_prob']*100)}"]
+    parts = [f"1X2 {round(s['home_prob'] * 100)}-{round(s['draw_prob'] * 100)}-{round(s['away_prob'] * 100)}"]
     if insight.totals_over_25 and insight.totals_under_25:
-        chunks.append(f"O2.5 {insight.totals_over_25:.2f} / U2.5 {insight.totals_under_25:.2f}")
+        parts.append(f"O2.5 {insight.totals_over_25:.2f} / U2.5 {insight.totals_under_25:.2f}")
     if insight.btts_yes and insight.btts_no:
-        chunks.append(f"BTTS {insight.btts_yes:.2f} / {insight.btts_no:.2f}")
+        parts.append(f"BTTS {insight.btts_yes:.2f} / {insight.btts_no:.2f}")
     if insight.totals_over_15:
-        chunks.append(f"O1.5 {insight.totals_over_15:.2f}")
-    return " | ".join(chunks)
+        parts.append(f"O1.5 {insight.totals_over_15:.2f}")
+    return " | ".join(parts)
 
 
 def pick_for_mode(insight: MatchInsight, mode: str) -> dict[str, Any]:
     s = insight.score_map
-    choices = {
-        "today": ("Best Available", insight.home_team if s["home_win"] >= s["away_win"] else insight.away_team, confidence(max(s["safe"], s["over25"])), "Low-Medium", "B+", insight.odds_home if s["home_win"] >= s["away_win"] else insight.odds_away, max(s["safe"], s["over25"])),
+    if mode == "today":
+        if insight.totals_over_15 and s["over15"] >= 0.72:
+            market = "Goals"
+            bet = "Over 1.5 Goals"
+            odds = insight.totals_over_15
+            risk = "Low"
+            value_rating = "A-"
+            key = s["over15"]
+            conf = confidence(s["over15"], 58, 88)
+        elif insight.odds_home and insight.odds_home <= 1.20 and s["home_win"] >= s["away_win"]:
+            market = "Goals"
+            bet = "Over 1.5 Goals" if insight.totals_over_15 else insight.home_team
+            odds = insight.totals_over_15 if insight.totals_over_15 else insight.odds_home
+            risk = "Low-Medium"
+            value_rating = "B+"
+            key = max(s["over15"], s["home_win"])
+            conf = confidence(max(s["over15"], s["home_win"]), 56, 86)
+        else:
+            market = "Best Available"
+            bet = insight.home_team if s["home_win"] >= s["away_win"] else insight.away_team
+            odds = insight.odds_home if s["home_win"] >= s["away_win"] else insight.odds_away
+            risk = "Low-Medium"
+            value_rating = "B+"
+            key = max(s["safe"], s["over25"])
+            conf = confidence(key)
+        return {
+            "market": market,
+            "bet": bet,
+            "confidence": conf,
+            "risk": risk,
+            "value": value_rating,
+            "odds": odds,
+            "key": key,
+            "stake": max(1, min(10, round((conf - 40) / 6))),
+            "support": support_summary(insight),
+        }
+
+    mapping = {
         "live": ("Watchlist", "Wait for in-play entry on the stronger side", confidence(max(s["value"] / 2.5, 0.48), 45, 74), "Medium", "B", insight.odds_home if s["home_win"] >= s["away_win"] else insight.odds_away, s["value"]),
         "safe": ("Double Chance", f"{insight.home_team} or Draw" if s["double_chance_home"] >= s["double_chance_away"] else f"{insight.away_team} or Draw", confidence(max(s["double_chance_home"], s["double_chance_away"]), 56, 87), "Low", "A-", insight.odds_home if s["double_chance_home"] >= s["double_chance_away"] else insight.odds_away, max(s["double_chance_home"], s["double_chance_away"])),
         "value": ("Value Bet", "Over 2.5 Goals" if insight.totals_over_25 and s["over25"] >= max(s["home_win"], s["away_win"]) else (insight.home_team if s["home_win"] >= s["away_win"] else insight.away_team), confidence(max(s["over25"], s["home_win"], s["away_win"]), 50, 82), "Medium", "A", insight.totals_over_25 if insight.totals_over_25 and s["over25"] >= max(s["home_win"], s["away_win"]) else (insight.odds_home if s["home_win"] >= s["away_win"] else insight.odds_away), s["value"]),
@@ -511,7 +574,7 @@ def pick_for_mode(insight: MatchInsight, mode: str) -> dict[str, Any]:
         "firsthalf": ("First Half", "Over 0.5 First Half Goals", confidence(s["first_half"], 46, 76), "Medium", "B", insight.totals_over_15, s["first_half"]),
         "secondhalf": ("Second Half", "Over 0.5 Second Half Goals", confidence(s["second_half"], 47, 78), "Medium", "B", insight.totals_over_15, s["second_half"]),
     }
-    market, bet, conf, risk, value_rating, odds, key_score = choices.get(mode, choices["today"])
+    market, bet, conf, risk, value_rating, odds, key = mapping.get(mode, mapping["safe"])
     return {
         "market": market,
         "bet": bet,
@@ -519,7 +582,7 @@ def pick_for_mode(insight: MatchInsight, mode: str) -> dict[str, Any]:
         "risk": risk,
         "value": value_rating,
         "odds": odds,
-        "key": key_score,
+        "key": key,
         "stake": max(1, min(10, round((conf - 40) / 6))),
         "support": support_summary(insight),
     }
@@ -571,6 +634,38 @@ def ai_reasoning(mode: str, picks: list[tuple[MatchInsight, dict[str, Any]]]) ->
         except Exception as exc:
             log.warning("Gemini reasoning failed: %s", exc)
 
+    if settings.openrouter_api_key:
+        try:
+            response = retry_request(
+                "POST",
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {settings.openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://render.com",
+                    "X-Title": "smart-football-bot",
+                },
+                json_body={
+                    "model": "openrouter/auto",
+                    "messages": [
+                        {"role": "system", "content": instruction},
+                        {"role": "user", "content": json.dumps(prompt_items, ensure_ascii=False)},
+                    ],
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=25,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                text = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    ai_cache.set(cache_key, parsed, AI_CACHE_TTL_SECONDS)
+                    return parsed
+        except Exception as exc:
+            log.warning("OpenRouter reasoning failed: %s", exc)
+
     fallback = {item[0].match_id: "This angle follows the current bookmaker pricing and market balance only." for item in picks}
     ai_cache.set(cache_key, fallback, AI_CACHE_TTL_SECONDS)
     return fallback
@@ -603,11 +698,13 @@ def build_prediction_message(mode: str, insights: list[MatchInsight], page: int 
             f"No football matches were available between the last {PAST_GRACE_HOURS} hours and the next {MATCH_WINDOW_HOURS} hours from The Odds API.",
             main_menu_keyboard(),
         )
+
     total_pages = max(1, (len(ordered) + MAX_PAGE_SIZE - 1) // MAX_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     selected = ordered[page * MAX_PAGE_SIZE : (page + 1) * MAX_PAGE_SIZE]
     picks = [(insight, pick_for_mode(insight, mode)) for insight in selected]
     ai_notes = ai_reasoning(mode, picks)
+
     title_map = {
         "today": "Today board",
         "live": "Live watchlist",
@@ -623,9 +720,10 @@ def build_prediction_message(mode: str, insights: list[MatchInsight], page: int 
         "firsthalf": "First half board",
         "secondhalf": "Second half board",
     }
+
     lines = [f"{title_map.get(mode, 'Betting board')} ({page + 1}/{total_pages})"]
     for insight, pick in picks:
-        odds_text = f"{pick['odds']:.2f}" if isinstance(pick['odds'], (int, float)) and pick['odds'] > 0 else "N/A"
+        odds_text = f"{pick['odds']:.2f}" if isinstance(pick["odds"], (int, float)) and pick["odds"] > 0 else "N/A"
         lines.extend(
             [
                 "",
@@ -684,12 +782,12 @@ def prediction_keyboard(mode: str, page: int, total_pages: int) -> dict[str, Any
 
 
 def help_text() -> str:
-    rows = ["Football Intelligence Pro", "", "Commands:"]
+    lines = ["Football Intelligence Pro", "", "Commands:"]
     for item in COMMAND_DESCRIPTIONS:
-        rows.append(f"/{item['command']} - {item['description']}")
-    rows.append("")
-    rows.append("Examples: /team arsenal | /match arsenal vs chelsea | /analyze arsenal vs chelsea")
-    return "\n".join(rows)
+        lines.append(f"/{item['command']} - {item['description']}")
+    lines.append("")
+    lines.append("Examples: /team arsenal | /match arsenal vs chelsea | /analyze arsenal vs chelsea")
+    return "\n".join(lines)
 
 
 def parse_command(text: str) -> tuple[str, str]:
@@ -722,39 +820,43 @@ def find_match(insights: list[MatchInsight], left: str, right: str) -> MatchInsi
 def single_match_text(insight: MatchInsight, mode: str) -> str:
     pick = pick_for_mode(insight, mode)
     reason = ai_reasoning(mode, [(insight, pick)]).get(insight.match_id, "This angle follows the current bookmaker pricing and market balance only.")
-    odds_text = f"{pick['odds']:.2f}" if isinstance(pick['odds'], (int, float)) and pick['odds'] > 0 else "N/A"
-    return "\n".join([
-        f"âš½ {insight.home_team} vs {insight.away_team}",
-        f"ðŸ† {insight.competition}",
-        f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
-        f"ðŸŽ¯ Market: {pick['market']}",
-        f"âœ… Bet: {pick['bet']}",
-        f"ðŸ”¥ Confidence: {pick['confidence']}%",
-        f"ðŸ“Š Stats: {pick['support']}",
-        f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
-        f"âš ï¸ Risk: {pick['risk']}",
-        f"â­ Value: {pick['value']}",
-        f"ðŸŽšï¸ Stake: {pick['stake']}/10",
-        f"ðŸ§  Why: {reason}",
-    ])
+    odds_text = f"{pick['odds']:.2f}" if isinstance(pick["odds"], (int, float)) and pick["odds"] > 0 else "N/A"
+    return "\n".join(
+        [
+            f"âš½ {insight.home_team} vs {insight.away_team}",
+            f"ðŸ† {insight.competition}",
+            f"ðŸ•’ {format_kickoff(insight.kickoff_utc)}",
+            f"ðŸŽ¯ Market: {pick['market']}",
+            f"âœ… Bet: {pick['bet']}",
+            f"ðŸ”¥ Confidence: {pick['confidence']}%",
+            f"ðŸ“Š Stats: {pick['support']}",
+            f"ðŸ’° Odds: {odds_text} via {insight.bookmaker}",
+            f"âš ï¸ Risk: {pick['risk']}",
+            f"â­ Value: {pick['value']}",
+            f"ðŸŽšï¸ Stake: {pick['stake']}/10",
+            f"ðŸ§  Why: {reason}",
+        ]
+    )
 
 
 def stats_text(insights: list[MatchInsight]) -> str:
     if not insights:
         return "No odds data loaded right now."
-    avg_home = round(sum(item.support_stats['home_prob'] for item in insights) / len(insights) * 100)
-    over25_values = [item.support_stats['over25_prob'] for item in insights if item.support_stats['over25_prob'] > 0]
-    btts_values = [item.support_stats['btts_yes_prob'] for item in insights if item.support_stats['btts_yes_prob'] > 0]
+    avg_home = round(sum(item.support_stats["home_prob"] for item in insights) / len(insights) * 100)
+    over25_values = [item.support_stats["over25_prob"] for item in insights if item.support_stats["over25_prob"] > 0]
+    btts_values = [item.support_stats["btts_yes_prob"] for item in insights if item.support_stats["btts_yes_prob"] > 0]
     avg_over25 = round(sum(over25_values) / len(over25_values) * 100) if over25_values else 0
     avg_btts = round(sum(btts_values) / len(btts_values) * 100) if btts_values else 0
-    return "\n".join([
-        "Loaded market stats",
-        f"Matches in next {MATCH_WINDOW_HOURS}h: {len(insights)}",
-        f"Average favorite implied win rate: {avg_home}%",
-        f"Average over 2.5 implied rate: {avg_over25}%",
-        f"Average BTTS implied rate: {avg_btts}%",
-        "Data source: The Odds API h2h/totals/spreads markets, with BTTS estimated only when the API does not provide it directly, and AI used only for wording.",
-    ])
+    return "\n".join(
+        [
+            "Loaded market stats",
+            f"Matches in last {PAST_GRACE_HOURS}h to next {MATCH_WINDOW_HOURS}h: {len(insights)}",
+            f"Average favorite implied win rate: {avg_home}%",
+            f"Average over 2.5 implied rate: {avg_over25}%",
+            f"Average BTTS estimated rate: {avg_btts}%",
+            "Data source: The Odds API h2h, totals, and spreads only, with BTTS estimated from totals when needed.",
+        ]
+    )
 
 
 def handle_text_command(command: str, args: str, insights: list[MatchInsight]) -> tuple[str, dict[str, Any] | None]:
